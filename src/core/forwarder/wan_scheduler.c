@@ -5,6 +5,7 @@
 #include "../../../inc/core/dataplane/crypto_route.h"
 #include "../../../inc/core/iface/interface.h"
 #include "../../../inc/core/flow/flow_table.h"
+#include "../../../inc/core/util/main_diag.h"
 
 #include <net/if.h>
 #include <stdio.h>
@@ -176,10 +177,9 @@ static void wan_drain_finish_slot(struct forwarder *fwd, int dp)
     profile_iface_xdp_detach_wan(&fwd->pair, dp);
     wan_stopped[dp] = 1;
     wan_drains[dp].active = 0;
-    fprintf(stderr,
-            "[WAN-DRAIN] %s stopped (queue flushed %u pkts, XDP detached)\n",
-            wan_drains[dp].ifname, dropped);
-    fflush(stderr);
+    main_diag_log(MAIN_DIAG_INFO, "WAN-DRAIN",
+                  "%s stopped; flushed %u queued packets",
+                  wan_drains[dp].ifname, dropped);
 }
 
 void fwd_wan_drain_tick(struct forwarder *fwd)
@@ -239,11 +239,11 @@ void fwd_wan_configure_live_drains(struct forwarder *fwd,
                  old->wans[ci].ifname);
         wan_drains[dp].start_ms = monotonic_ms();
         wan_drains[dp].until_ms = wan_drains[dp].start_ms + WAN_DRAIN_GRACE_MS;
-        fprintf(stderr,
-                "[WAN-DRAIN] %s weight=0 — taper %us (bandwidth removed, no new flows)\n",
-                wan_drains[dp].ifname, (unsigned)(WAN_DRAIN_GRACE_MS / 1000u));
+        main_diag_log(MAIN_DIAG_INFO, "WAN-DRAIN",
+                      "%s draining for %us",
+                      wan_drains[dp].ifname,
+                      (unsigned)(WAN_DRAIN_GRACE_MS / 1000u));
     }
-    fflush(stderr);
 }
 
 static int wan_weight_blend_progress(const wan_weight_blend *b)
@@ -345,10 +345,10 @@ void fwd_wan_join_ramp_begin(int cfg_wan, int target_weight)
     wan_joins[slot].target_w = target_weight > 0 ? target_weight : 1;
     wan_joins[slot].start_ms = monotonic_ms();
     wan_joins[slot].until_ms = wan_joins[slot].start_ms + WAN_DRAIN_GRACE_MS;
-    fprintf(stderr, "[WAN-ADMIN] join ramp cfg_wan=%d weight 0→%d over %us\n",
-            cfg_wan, wan_joins[slot].target_w,
-            (unsigned)(WAN_DRAIN_GRACE_MS / 1000u));
-    fflush(stderr);
+    main_diag_log(MAIN_DIAG_INFO, "WAN-ADMIN",
+                  "WAN %d ramping to weight %d over %us", cfg_wan,
+                  wan_joins[slot].target_w,
+                  (unsigned)(WAN_DRAIN_GRACE_MS / 1000u));
 }
 
 void fwd_wan_join_ramp_tick(void)
@@ -370,10 +370,8 @@ void fwd_wan_weight_blend_begin(const struct app_config *old, const struct app_c
 
     wan_weight_blends[0].active = 0;
 
-    if (old->profile_count < 1 || new->profile_count < 1) {
-        fflush(stderr);
+    if (old->profile_count < 1 || new->profile_count < 1)
         return;
-    }
 
     {
         const struct profile_config *np = &new->profiles[0];
@@ -383,10 +381,8 @@ void fwd_wan_weight_blend_begin(const struct app_config *old, const struct app_c
         wan_weight_blend *b;
 
         (void)profile_slot_for_id;
-        if (op->id != np->id || op->wan_count != np->wan_count) {
-            fflush(stderr);
+        if (op->id != np->id || op->wan_count != np->wan_count)
             return;
-        }
         for (int i = 0; i < np->wan_count; i++) {
             if (op->wan_indices[i] != np->wan_indices[i] ||
                 op->wan_bandwidth_weight[i] != np->wan_bandwidth_weight[i]) {
@@ -394,10 +390,8 @@ void fwd_wan_weight_blend_begin(const struct app_config *old, const struct app_c
                 break;
             }
         }
-        if (!changed) {
-            fflush(stderr);
+        if (!changed)
             return;
-        }
 
         slot = 0;
         b = &wan_weight_blends[slot];
@@ -411,11 +405,10 @@ void fwd_wan_weight_blend_begin(const struct app_config *old, const struct app_c
             b->old_w[i] = op->wan_bandwidth_weight[i];
             b->new_w[i] = np->wan_bandwidth_weight[i];
         }
-        fprintf(stderr,
-                "[WAN-BALANCE] profile %d — WAN weights blend %us (old→new, flows migrate gradually)\n",
-                np->id, (unsigned)(WAN_DRAIN_GRACE_MS / 1000u));
+        main_diag_log(MAIN_DIAG_INFO, "WAN-BALANCE",
+                      "profile %d blending WAN weights over %us", np->id,
+                      (unsigned)(WAN_DRAIN_GRACE_MS / 1000u));
     }
-    fflush(stderr);
 }
 
 int fwd_wan_live_dp_for_cfg(struct forwarder *fwd, int cfg_wan)

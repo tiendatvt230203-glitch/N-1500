@@ -3,6 +3,7 @@
 
 #include "../../inc/db/db_config.h"
 #include "../../inc/db/db_env.h"
+#include "../../inc/core/util/main_diag.h"
 
 #include <libpq-fe.h>
 #include <stdio.h>
@@ -15,7 +16,8 @@ int ne_profile_id_exists(int profile_id) {
 
     PGconn *conn = PQconnectdbParams(pg.keywords, pg.values, 0);
     if (PQstatus(conn) != CONNECTION_OK) {
-        fprintf(stderr, "[DB] connection failed: %s", PQerrorMessage(conn));
+        main_diag_log(MAIN_DIAG_ERROR, "DB", "connection failed: %s",
+                      PQerrorMessage(conn));
         PQfinish(conn);
         return -1;
     }

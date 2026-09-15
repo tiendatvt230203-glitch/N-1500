@@ -1,4 +1,5 @@
 #include "../include/pqc_vault.h"
+#include "../../../inc/core/util/main_diag.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -115,8 +116,6 @@ static void load_env_file(void) {
             parse_vault_url(val);
         } else if (strcmp(key, "VAULT_TOKEN") == 0) {
             strncpy(g_vault_token, val, sizeof(g_vault_token) - 1);
-            // g_vault_token[sizeof(g_vault_token) - 1] = '\0';
-            // fprintf(stderr, "[PQC-VAULT-ENV] Loaded VAULT_TOKEN: [%s] (len=%zu)\n", g_vault_token, strlen(g_vault_token));
         } else if (strcmp(key, "UNSEAL_KEY1") == 0) {
             strncpy(g_unseal_key1, val, sizeof(g_unseal_key1) - 1);
         } else if (strcmp(key, "UNSEAL_KEY2") == 0) {
@@ -133,7 +132,8 @@ static void load_env_file(void) {
 static int http_request(const char *method, const char *path, const char *body, char *resp_buf, size_t max_resp) {
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) {
-        perror("[PQC-VAULT] Socket creation error");
+        main_diag_log(MAIN_DIAG_ERROR, "PQC-VAULT",
+                      "socket creation failed: %s", strerror(errno));
         return -1;
     }
 
@@ -151,7 +151,8 @@ static int http_request(const char *method, const char *path, const char *body, 
     if (inet_pton(AF_INET, g_vault_host, &serv_addr.sin_addr) <= 0) {
         struct hostent *he = gethostbyname(g_vault_host);
         if (!he) {
-            fprintf(stderr, "[PQC-VAULT] Cannot resolve host: %s\n", g_vault_host);
+            main_diag_log(MAIN_DIAG_ERROR, "PQC-VAULT",
+                          "cannot resolve host %s", g_vault_host);
             close(sockfd);
             return -1;
         }
@@ -159,7 +160,9 @@ static int http_request(const char *method, const char *path, const char *body, 
     }
 
     if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        fprintf(stderr, "[PQC-VAULT] Connection failed to %s:%d - %s\n", g_vault_host, g_vault_port, strerror(errno));
+        main_diag_log(MAIN_DIAG_ERROR, "PQC-VAULT",
+                      "connection to %s:%d failed: %s",
+                      g_vault_host, g_vault_port, strerror(errno));
         close(sockfd);
         return -1;
     }
@@ -181,7 +184,8 @@ static int http_request(const char *method, const char *path, const char *body, 
         g_vault_token, body_len, body ? body : "");
 
     if (send(sockfd, req, req_len, 0) < 0) {
-        perror("[PQC-VAULT] Send HTTP request failed");
+        main_diag_log(MAIN_DIAG_ERROR, "PQC-VAULT",
+                      "HTTP request send failed: %s", strerror(errno));
         close(sockfd);
         return -1;
     }
@@ -226,38 +230,34 @@ int sig_pqc_vault_ensure_unsealed(void) {
     char response[8192];
     int rc = http_request("GET", "/v1/sys/seal-status", NULL, response, sizeof(response));
     if (rc < 0) {
-        fprintf(stderr, "[PQC-VAULT] Error checking Vault seal status.\n");
+        main_diag_log(MAIN_DIAG_ERROR, "PQC-VAULT",
+                      "cannot check seal status");
         return -1;
     }
 
     bool sealed = parse_json_sealed_status(response);
     if (!sealed) {
-        // fprintf(stderr, "[PQC-VAULT] Vault is UNSEALED and ready.\n");
         return 0;
     }
 
-    fprintf(stderr, "[PQC-VAULT] Vault is SEALED. Attempting automatic unseal using configured keys...\n");
     if (strlen(g_unseal_key1) > 0) {
-        fprintf(stderr, "[PQC-VAULT] Sending Unseal Key 1...\n");
         send_unseal_key(g_unseal_key1);
     }
     if (strlen(g_unseal_key2) > 0) {
-        fprintf(stderr, "[PQC-VAULT] Sending Unseal Key 2...\n");
         send_unseal_key(g_unseal_key2);
     }
     if (strlen(g_unseal_key3) > 0) {
-        fprintf(stderr, "[PQC-VAULT] Sending Unseal Key 3...\n");
         send_unseal_key(g_unseal_key3);
     }
 
     // Verify status again after sending unseal keys
     rc = http_request("GET", "/v1/sys/seal-status", NULL, response, sizeof(response));
     if (rc >= 0 && !parse_json_sealed_status(response)) {
-        fprintf(stderr, "[PQC-VAULT] SUCCESS: Vault has been UNSEALED!\n");
         return 0;
     }
 
-    fprintf(stderr, "[PQC-VAULT] ERROR: Vault is still SEALED after submitting unseal keys.\n");
+    main_diag_log(MAIN_DIAG_ERROR, "PQC-VAULT",
+                  "Vault remains sealed after automatic unseal");
     return -1;
 }
 
@@ -265,20 +265,9 @@ int sig_pqc_init_vault(void) {
     if (g_vault_initialized) return 0;
 
     load_env_file();
-    char tok_preview[32] = "EMPTY";
-    size_t tok_len = strlen(g_vault_token);
-    if (tok_len > 0) {
-        if (tok_len > 8) {
-            snprintf(tok_preview, sizeof(tok_preview), "%.6s... (len=%zu)", g_vault_token, tok_len);
-        } else {
-            snprintf(tok_preview, sizeof(tok_preview),"SET (len=%zu)", tok_len);
-        }
-    } 
-    // fprintf(stderr, "[PQC-VAULT] Initializing Vault client (Address: %s, Host: %s:%d, Token: '%s')\n",
-    //         g_vault_addr, g_vault_host, g_vault_port, g_vault_token[0] ? g_vault_token : "EMPTY");
-
     if (sig_pqc_vault_ensure_unsealed() != 0) {
-        fprintf(stderr, "[PQC-VAULT] WARNING: Vault server is not ready/unsealed.\n");
+        main_diag_log(MAIN_DIAG_WARN, "PQC-VAULT",
+                      "Vault server is not ready or unsealed");
     }
 
     g_vault_initialized = true;
@@ -334,7 +323,8 @@ int sig_pqc_vault_read_key(const char *path_type, const char *fingerprint_filena
     }
 
     if (rc <= 0 || (strncmp(response, "HTTP/1.1 200", 12) != 0)) {
-        fprintf(stderr, "[PQC-VAULT] Read key failed from Vault for [%s/%s]. Response code not 200.\n",
+        main_diag_log(MAIN_DIAG_ERROR, "PQC-VAULT",
+                "key read failed for %s/%s: response is not HTTP 200",
                 path_type, clean_filename);
         return -1;
     }
@@ -342,12 +332,11 @@ int sig_pqc_vault_read_key(const char *path_type, const char *fingerprint_filena
     // Extract the "key" value from the JSON payload
     if (extract_json_value(response, "key", out_key_buf, max_len) ||
         extract_json_value(response, "value", out_key_buf, max_len)) {
-        fprintf(stderr, "[PQC-VAULT-LOG] SUCCESS: Key [%s/%s] retrieved 100%% directly from HashiCorp Vault (REST Endpoint: %s%s)\n",
-                path_type, clean_filename, g_vault_addr, url_path);
         return 0;
     }
 
-    fprintf(stderr, "[PQC-VAULT] Error parsing JSON key from Vault response for [%s/%s]\n",
+    main_diag_log(MAIN_DIAG_ERROR, "PQC-VAULT",
+            "cannot parse key response for %s/%s",
             path_type, clean_filename);
     return -1;
 }
@@ -377,7 +366,6 @@ int sig_pqc_vault_write_key(const char *path_type, const char *fingerprint_filen
     }
 
     if (rc > 0 && (strncmp(response, "HTTP/1.1 200", 12) == 0 || strncmp(response, "HTTP/1.1 204", 12) == 0)) {
-        // fprintf(stderr, "[PQC-VAULT] Successfully wrote key to Vault: [kv/PQC_Key/%s/%s]\n", path_type, clean_filename);
         return 0;
     }
 
@@ -396,9 +384,11 @@ int sig_pqc_vault_write_key(const char *path_type, const char *fingerprint_filen
     const char *body_start = strstr(response, "\r\n\r\n");
     if (body_start) body_start += 4;
     else body_start = response;
-    fprintf(stderr, "[PQC-VAULT] ERROR: Failed to write key to Vault: [kv/PQC-Key/%s/%s]", path_type, clean_filename);
-    fprintf(stderr, "[PQC-VAULT] ERROR DETAIL -> Status: %s | Response Body: %s\n", 
-             status_line[0] ? status_line : "N/A", body_start[0] ? body_start : "Empty");
+    main_diag_log(MAIN_DIAG_ERROR, "PQC-VAULT",
+                  "key write failed for %s/%s: status=%s body=%s",
+                  path_type, clean_filename,
+                  status_line[0] ? status_line : "N/A",
+                  body_start[0] ? body_start : "Empty");
     
     return -1;
 }

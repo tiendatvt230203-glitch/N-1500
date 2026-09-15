@@ -1,6 +1,5 @@
 #include "../../../inc/core/dataplane/arp_bridge.h"
 #include "../../../inc/core/util/config.h"
-#include "../../../inc/core/util/main_diag.h"
 #include "../../../inc/core/dataplane/crypto_route.h"
 #include "../../../inc/core/dataplane/dataplane_util.h"
 #include "../../../inc/core/forwarder/forwarder_crypto_runtime.h"
@@ -107,8 +106,6 @@ static int arp_crypto_ctx_snapshot(const struct app_config *cfg, int profile_idx
 
     if (using_static)
         *using_static = !dynamic_ready;
-    main_diag_log_arp_key(profile_id, ctx->keys[KEY_SLOT_CURRENT],
-                          !dynamic_ready);
     return 0;
 }
 

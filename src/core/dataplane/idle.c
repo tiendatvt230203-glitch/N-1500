@@ -1,10 +1,10 @@
 #include "../../../inc/core/dataplane/dp_idle.h"
+#include "../../../inc/core/util/main_diag.h"
 
 #include <errno.h>
 #include <poll.h>
 #include <sched.h>
 #include <stdatomic.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
@@ -68,15 +68,11 @@ void ne_dp_idle_init(void)
         g_efd[i] = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
         atomic_store_explicit(&g_sleeping[i], 0, memory_order_relaxed);
         if (g_efd[i] < 0)
-            fprintf(stderr, "[DP-IDLE] eventfd %d failed: %s\n", i, strerror(errno));
+            main_diag_log(MAIN_DIAG_ERROR, "DP-IDLE",
+                          "eventfd %d failed: %s", i, strerror(errno));
     }
 
     g_ready = 1;
-    if (g_busy_poll)
-        fprintf(stderr, "[DP-IDLE] busy-poll (NE_DP_BUSY_POLL=1)\n");
-    else
-        fprintf(stderr, "[DP-IDLE] adaptive idle (set NE_DP_BUSY_POLL=1 to spin)\n");
-    fflush(stderr);
 }
 
 void ne_dp_idle_shutdown(void)

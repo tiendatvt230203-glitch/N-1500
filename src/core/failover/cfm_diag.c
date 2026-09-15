@@ -1,8 +1,7 @@
 #include "cfm.h"
 #include "../../../inc/core/failover/cfm_diag.h"
 #include "../../../inc/core/util/config.h"
-#include "../../../inc/core/flow/mac_learn.h"
-#include "../../../inc/core/forwarder/forwarder.h"
+#include "../../../inc/core/util/main_diag.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,53 +79,6 @@ static pthread_t g_cfm_thread;
 static volatile bool g_cfm_running = false;
 static pthread_mutex_t g_cfm_init_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static cfm_link_state_cb g_state_cb;
-static void *g_state_cb_user;
-static pthread_mutex_t g_cb_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static void log_unified_mac_table(const char *event)
-{
-    struct forwarder *fwd = NULL;
-
-    pthread_mutex_lock(&g_cb_lock);
-    fwd = (struct forwarder *)g_state_cb_user;
-    pthread_mutex_unlock(&g_cb_lock);
-    mac_learn_log_runtime_table(fwd, fwd ? fwd->cfg : NULL, event);
-}
-
-static void notify_is_up(cfm_link_t *link, bool old_up, int print_table)
-{
-    cfm_link_state_cb cb;
-    void *user;
-    int old_state;
-    int new_state;
-    int wan_dp;
-
-    if (link->is_up == old_up)
-        return;
-
-    old_state = old_up ? CFM_LINK_STATE_UP : CFM_LINK_STATE_DOWN;
-    new_state = link->is_up ? CFM_LINK_STATE_UP : CFM_LINK_STATE_DOWN;
-    wan_dp = link->wan_dp;
-
-    pthread_mutex_lock(&g_cb_lock);
-    cb = g_state_cb;
-    user = g_state_cb_user;
-    pthread_mutex_unlock(&g_cb_lock);
-    if (cb)
-        cb(wan_dp, link->ifname, old_state, new_state, user);
-    if (print_table) {
-        char ev[96];
-
-        snprintf(ev, sizeof(ev),
-                 "WAN %s if=%s (failover %s)",
-                 link->is_up ? "UP" : "DOWN",
-                 link->ifname[0] ? link->ifname : "-",
-                 link->is_up ? "restore/-ai" : "kick/-di");
-        log_unified_mac_table(ev);
-    }
-}
-
 static cfm_link_t *find_link_by_wan_dp(int wan_dp)
 {
     if (wan_dp < 0)
@@ -157,28 +109,6 @@ static void cfm_bridge_for_wan_dp(const struct app_config *cfg, int wan_dp,
     }
 }
 
-int cfm_snapshot_wan_peers(struct cfm_wan_snap *out, int max)
-{
-    int n = 0;
-
-    if (!out || max <= 0)
-        return 0;
-    for (int i = 0; i < g_link_count && n < max; i++) {
-        pthread_mutex_lock(&g_links[i].lock);
-        strncpy(out[n].ifname, g_links[i].ifname, sizeof(out[n].ifname) - 1);
-        out[n].ifname[sizeof(out[n].ifname) - 1] = '\0';
-        strncpy(out[n].bridge, g_links[i].bridge, sizeof(out[n].bridge) - 1);
-        out[n].bridge[sizeof(out[n].bridge) - 1] = '\0';
-        memcpy(out[n].peer_mac, g_links[i].remote_mac, 6);
-        out[n].mac_learned = g_links[i].mac_learned ? 1 : 0;
-        out[n].is_up = g_links[i].is_up ? 1 : 0;
-        pthread_mutex_unlock(&g_links[i].lock);
-        n++;
-    }
-    return n;
-}
-
-/* Same is_up the [mac] table prints — lookup by wan ifname or bridge. */
 int cfm_wan_status_by_name(const char *name)
 {
     int matched = 0;
@@ -269,19 +199,21 @@ int cfm_status_ipc_query(const char *name)
     int got = 0;
 
     if (!name || !name[0]) {
-        fprintf(stderr, "[ERR] -gs requires <wan_if|bridge>\n");
+        main_diag_log(MAIN_DIAG_ERROR, "CFM-CLI",
+                      "-gs requires <wan_if|bridge>");
         return 1;
     }
     fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
-        fprintf(stderr, "[ERR] -gs: socket failed\n");
+        main_diag_log(MAIN_DIAG_ERROR, "CFM-CLI",
+                      "socket failed: %s", strerror(errno));
         return 1;
     }
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, CFM_STATUS_IPC_PATH, sizeof(addr.sun_path) - 1);
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "[ERR] -gs: daemon not running\n");
+        main_diag_log(MAIN_DIAG_ERROR, "CFM-CLI", "daemon is not running");
         close(fd);
         return 1;
     }
@@ -297,7 +229,8 @@ int cfm_status_ipc_query(const char *name)
     }
     close(fd);
     if (!got) {
-        fprintf(stderr, "[ERR] no WAN matched: %s\n", name);
+        main_diag_log(MAIN_DIAG_ERROR, "CFM-CLI",
+                      "no WAN matched %s", name);
         return 1;
     }
     return 0;
@@ -359,7 +292,6 @@ static void *cfm_monitor_thread(void *arg) {
     (void)arg;
     struct pollfd fds[MAX_INTERFACES];
     uint64_t last_tx_time = get_time_ms();
-    uint64_t last_wait_log = 0;
 
     while (g_cfm_running) {
         int active_fds = 0;
@@ -459,14 +391,10 @@ static void *cfm_monitor_thread(void *arg) {
                     }
 
                     {
-                        bool old_up;
                         uint64_t now = get_time_ms();
 
                         pthread_mutex_lock(&g_links[j].lock);
-                        old_up = g_links[j].is_up;
                         if (!g_links[j].mac_learned) {
-                            char ev[96];
-
                             memcpy(g_links[j].remote_mac, src_mac, 6);
                             g_links[j].remote_mep_id = rx_mep_id;
                             g_links[j].mac_learned = true;
@@ -475,21 +403,10 @@ static void *cfm_monitor_thread(void *arg) {
                             g_links[j].consecutive_fails = 0;
                             g_links[j].consecutive_successes = CFM_UP_CONFIRM;
                             g_links[j].rx_peer_ccm++;
-                            snprintf(ev, sizeof(ev),
-                                     "learn-peer if=%s mac=%02x:%02x:%02x:%02x:%02x:%02x",
-                                     g_links[j].ifname,
-                                     src_mac[0], src_mac[1], src_mac[2],
-                                     src_mac[3], src_mac[4], src_mac[5]);
                             pthread_mutex_unlock(&g_links[j].lock);
-                            log_unified_mac_table(ev);
-                            notify_is_up(&g_links[j], old_up, 0);
                             continue;
                         } else if (memcmp(src_mac, g_links[j].remote_mac, 6) != 0) {
                             /* Peer MAC đổi — cập nhật, không giữ MAC cũ. */
-                            char ev[128];
-                            uint8_t old_mac[6];
-
-                            memcpy(old_mac, g_links[j].remote_mac, 6);
                             memcpy(g_links[j].remote_mac, src_mac, 6);
                             g_links[j].remote_mep_id = rx_mep_id;
                             g_links[j].last_recv_time = now;
@@ -497,18 +414,7 @@ static void *cfm_monitor_thread(void *arg) {
                             g_links[j].consecutive_successes = CFM_UP_CONFIRM;
                             g_links[j].is_up = true;
                             g_links[j].rx_peer_ccm++;
-                            snprintf(ev, sizeof(ev),
-                                     "peer-mac-change if=%s "
-                                     "old=%02x:%02x:%02x:%02x:%02x:%02x "
-                                     "new=%02x:%02x:%02x:%02x:%02x:%02x",
-                                     g_links[j].ifname,
-                                     old_mac[0], old_mac[1], old_mac[2],
-                                     old_mac[3], old_mac[4], old_mac[5],
-                                     src_mac[0], src_mac[1], src_mac[2],
-                                     src_mac[3], src_mac[4], src_mac[5]);
                             pthread_mutex_unlock(&g_links[j].lock);
-                            log_unified_mac_table(ev);
-                            notify_is_up(&g_links[j], old_up, 0);
                             continue;
                         } else if (rx_mep_id == g_links[j].remote_mep_id) {
                             g_links[j].last_recv_time = now;
@@ -520,7 +426,6 @@ static void *cfm_monitor_thread(void *arg) {
                             g_links[j].rx_peer_ccm++;
                         }
                         pthread_mutex_unlock(&g_links[j].lock);
-                        notify_is_up(&g_links[j], old_up, 1);
                     }
                 }
             }
@@ -531,14 +436,11 @@ static void *cfm_monitor_thread(void *arg) {
         if (now - last_tx_time >= CFM_INTERVAL_MS) {
             for (int i = 0; i < g_link_count; i++) {
                 if (g_links[i].sock_fd >= 0) {
-                    bool old_up;
-
                     // Send out heartbeat
                     send_ccm_packet(&g_links[i]);
 
                     // Evaluate health status (debounce + startup timeout)
                     pthread_mutex_lock(&g_links[i].lock);
-                    old_up = g_links[i].is_up;
                     if (g_links[i].mac_learned) {
                         if (now - g_links[i].last_recv_time > CFM_TIMEOUT_MS) {
                             g_links[i].consecutive_fails++;
@@ -561,28 +463,9 @@ static void *cfm_monitor_thread(void *arg) {
                         }
                     }
                     pthread_mutex_unlock(&g_links[i].lock);
-                    notify_is_up(&g_links[i], old_up, 1);
                 }
             }
             last_tx_time = now;
-        }
-
-        /* Waiting for peer MAC: one table, not per-iface spam mixed with traffic. */
-        now = get_time_ms();
-        if (now - last_wait_log >= 5000) {
-            int waiting = 0;
-
-            for (int i = 0; i < g_link_count; i++) {
-                if (g_links[i].sock_fd < 0)
-                    continue;
-                pthread_mutex_lock(&g_links[i].lock);
-                if (!g_links[i].mac_learned)
-                    waiting++;
-                pthread_mutex_unlock(&g_links[i].lock);
-            }
-            if (waiting > 0)
-                log_unified_mac_table("wait-peer");
-            last_wait_log = now;
         }
     }
     return NULL;
@@ -619,13 +502,16 @@ int cfm_init(const struct app_config *cfg) {
 
         int ifindex = if_nametoindex(wan->ifname);
         if (ifindex == 0) {
-            fprintf(stderr, "[CFM-INIT] Warning: Interface %s index not found.\n", wan->ifname);
+            main_diag_log(MAIN_DIAG_WARN, "CFM",
+                          "interface %s index not found", wan->ifname);
             continue;
         }
 
         int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
         if (sock < 0) {
-            fprintf(stderr, "[CFM-INIT] Error: Cannot create raw socket for %s: %s\n", wan->ifname, strerror(errno));
+            main_diag_log(MAIN_DIAG_ERROR, "CFM",
+                          "cannot create raw socket for %s: %s",
+                          wan->ifname, strerror(errno));
             continue;
         }
 
@@ -636,7 +522,9 @@ int cfm_init(const struct app_config *cfg) {
         sll.sll_ifindex = ifindex;
         sll.sll_protocol = htons(ETH_P_ALL);
         if (bind(sock, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
-            fprintf(stderr, "[CFM-INIT] Error: Cannot bind raw socket to %s: %s\n", wan->ifname, strerror(errno));
+            main_diag_log(MAIN_DIAG_ERROR, "CFM",
+                          "cannot bind raw socket to %s: %s",
+                          wan->ifname, strerror(errno));
             close(sock);
             continue;
         }
@@ -649,8 +537,9 @@ int cfm_init(const struct app_config *cfg) {
             int ignore_out = 1;
             if (setsockopt(sock, SOL_PACKET, PACKET_IGNORE_OUTGOING,
                            &ignore_out, sizeof(ignore_out)) < 0) {
-                fprintf(stderr, "[CFM-INIT] Warning: PACKET_IGNORE_OUTGOING %s: %s\n",
-                        wan->ifname, strerror(errno));
+                main_diag_log(MAIN_DIAG_WARN, "CFM",
+                              "PACKET_IGNORE_OUTGOING failed for %s: %s",
+                              wan->ifname, strerror(errno));
             }
         }
         {
@@ -660,8 +549,9 @@ int cfm_init(const struct app_config *cfg) {
             if (ioctl(sock, SIOCGIFFLAGS, &ifr_p) == 0) {
                 ifr_p.ifr_flags |= IFF_PROMISC;
                 if (ioctl(sock, SIOCSIFFLAGS, &ifr_p) < 0) {
-                    fprintf(stderr, "[CFM-INIT] Warning: IFF_PROMISC %s: %s\n",
-                            wan->ifname, strerror(errno));
+                    main_diag_log(MAIN_DIAG_WARN, "CFM",
+                                  "IFF_PROMISC failed for %s: %s",
+                                  wan->ifname, strerror(errno));
                 }
             }
         }
@@ -671,8 +561,9 @@ int cfm_init(const struct app_config *cfg) {
             mreq.mr_ifindex = ifindex;
             mreq.mr_type = PACKET_MR_PROMISC;
             if (setsockopt(sock, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
-                fprintf(stderr, "[CFM-INIT] Warning: PACKET_MR_PROMISC %s: %s\n",
-                        wan->ifname, strerror(errno));
+                main_diag_log(MAIN_DIAG_WARN, "CFM",
+                              "PACKET_MR_PROMISC failed for %s: %s",
+                              wan->ifname, strerror(errno));
             }
             memset(&mreq, 0, sizeof(mreq));
             mreq.mr_ifindex = ifindex;
@@ -680,8 +571,9 @@ int cfm_init(const struct app_config *cfg) {
             mreq.mr_alen = 6;
             memcpy(mreq.mr_address, CFM_MULTICAST_MAC, 6);
             if (setsockopt(sock, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
-                fprintf(stderr, "[CFM-INIT] Warning: CFM multicast join %s: %s\n",
-                        wan->ifname, strerror(errno));
+                main_diag_log(MAIN_DIAG_WARN, "CFM",
+                              "multicast join failed for %s: %s",
+                              wan->ifname, strerror(errno));
             }
         }
 
@@ -743,10 +635,10 @@ int cfm_init(const struct app_config *cfg) {
     }
 
     if (initialized_links > 0) {
-        log_unified_mac_table("init");
         g_cfm_running = true;
         if (pthread_create(&g_cfm_thread, NULL, cfm_monitor_thread, NULL) != 0) {
-            fprintf(stderr, "[CFM-INIT] Error: Failed to create CFM monitor thread.\n");
+            main_diag_log(MAIN_DIAG_ERROR, "CFM",
+                          "cannot create monitor thread");
             g_cfm_running = false;
             for (int i = 0; i < g_link_count; i++) {
                 close(g_links[i].sock_fd);
@@ -756,11 +648,6 @@ int cfm_init(const struct app_config *cfg) {
             pthread_mutex_unlock(&g_cfm_init_lock);
             return -1;
         }
-        fprintf(stderr, "[CFM-INIT] CFM started on %d WAN(s)\n", initialized_links);
-        fflush(stderr);
-    } else {
-        fprintf(stderr, "[CFM-INIT] No WAN interfaces initialized for CFM.\n");
-        fflush(stderr);
     }
 
     pthread_mutex_unlock(&g_cfm_init_lock);
@@ -799,14 +686,5 @@ void cfm_cleanup(void) {
     }
     g_link_count = 0;
 
-    printf("[CFM-CLEANUP] CFM diagnostic daemon stopped.\n");
     pthread_mutex_unlock(&g_cfm_init_lock);
-}
-
-void cfm_set_state_callback(cfm_link_state_cb cb, void *user)
-{
-    pthread_mutex_lock(&g_cb_lock);
-    g_state_cb = cb;
-    g_state_cb_user = user;
-    pthread_mutex_unlock(&g_cb_lock);
 }

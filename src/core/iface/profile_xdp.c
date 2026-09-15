@@ -2,6 +2,7 @@
 #include "../../../inc/core/iface/profile_iface_lifecycle.h"
 
 #include "../../../inc/core/iface/interface.h"
+#include "../../../inc/core/util/main_diag.h"
 #include "../../../inc/crypto/eth_parse.h"
 
 #include <bpf/bpf.h>
@@ -13,28 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
-
-static void profile_xdp_stop_log(const char *step, const char *ifname)
-{
-    struct timespec ts;
-
-    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
-        fprintf(stderr, "[STOP] xdp %s", step);
-        if (ifname && ifname[0])
-            fprintf(stderr, " %s", ifname);
-        fprintf(stderr, "\n");
-        fflush(stderr);
-        return;
-    }
-    fprintf(stderr, "[STOP] %ld.%03ld xdp %s",
-            (long)ts.tv_sec, ts.tv_nsec / 1000000L, step);
-    if (ifname && ifname[0])
-        fprintf(stderr, " %s", ifname);
-    fprintf(stderr, "\n");
-    fflush(stderr);
-}
 
 static int profile_iface_ifname_safe(const char *ifname)
 {
@@ -54,14 +34,13 @@ static void profile_iface_xdp_link_off(const char *ifname)
     if (!profile_iface_ifname_safe(ifname))
         return;
 
-    profile_xdp_stop_log("detach begin", ifname);
     /* ip link only — bpf_xdp_detach can block forever when no prog
      * is attached (post-crash scrub) or after bpf_object__close already ran. */
     snprintf(cmd, sizeof(cmd), "/sbin/ip link set dev %s xdp off >/dev/null 2>&1",
              ifname);
     if (system(cmd) == -1)
-        profile_xdp_stop_log("detach command failed", ifname);
-    profile_xdp_stop_log("detach done", ifname);
+        main_diag_log(MAIN_DIAG_WARN, "PROFILE-XDP",
+                      "detach command failed for %s", ifname);
 }
 
 void profile_iface_xdp_detach_ifname(const char *ifname)
@@ -88,9 +67,6 @@ void profile_iface_xdp_detach_local(struct ne_pair *p, int pair_li)
     if (!p->xdp_local_on[pair_li] && !p->bpf_locals[pair_li])
         return;
 
-    fprintf(stderr, "[PROFILE-XDP] DETACH LAN %s (slot %d)\n",
-            p->locals[pair_li].ifname, pair_li);
-    fflush(stderr);
     ne_pair_delete_local_xsks(p, pair_li);
     if (p->bpf_locals[pair_li]) {
         bpf_object__close(p->bpf_locals[pair_li]);
@@ -107,9 +83,6 @@ void profile_iface_xdp_detach_wan(struct ne_pair *p, int dp_slot)
     if (!p->xdp_wan_on[dp_slot] && !p->bpf_wans[dp_slot])
         return;
 
-    fprintf(stderr, "[PROFILE-XDP] DETACH WAN %s (dp slot %d)\n",
-            p->wans[dp_slot].ifname, dp_slot);
-    fflush(stderr);
     ne_pair_delete_wan_xsks(p, dp_slot);
     if (p->bpf_wans[dp_slot]) {
         bpf_object__close(p->bpf_wans[dp_slot]);
@@ -123,8 +96,6 @@ void profile_iface_xdp_prepare_init(const struct app_config *cfg)
 {
     if (!cfg)
         return;
-    fprintf(stderr, "[PROFILE-XDP] prepare: scrub leftover XDP on configured LAN/WAN\n");
-    fflush(stderr);
     profile_iface_xdp_detach_config(cfg);
 
     usleep(200000);
@@ -152,12 +123,14 @@ static int profile_iface_ifindex(const char *ifname, const char *role)
     unsigned int idx;
 
     if (!ifname || !ifname[0]) {
-        fprintf(stderr, "[PROFILE-XDP] %s: missing interface name\n", role);
+        main_diag_log(MAIN_DIAG_ERROR, "PROFILE-XDP",
+                      "%s missing interface name", role);
         return -1;
     }
     idx = if_nametoindex(ifname);
     if (idx == 0) {
-        fprintf(stderr, "[PROFILE-XDP] %s %s: interface not found\n", role, ifname);
+        main_diag_log(MAIN_DIAG_ERROR, "PROFILE-XDP",
+                      "%s interface %s not found", role, ifname);
         return -1;
     }
     return (int)idx;
@@ -168,13 +141,11 @@ static int xdp_attach_prog(int ifindex, int prog_fd, const char *ifname, const c
     int rc = bpf_xdp_attach(ifindex, prog_fd, XDP_FLAGS_DRV_MODE, NULL);
 
     if (rc) {
-        fprintf(stderr, "[PROFILE-XDP] attach failed %s %s drv: %s\n",
-                role, ifname, strerror(rc < 0 ? -rc : rc));
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_ERROR, "PROFILE-XDP",
+                      "attach failed for %s %s in driver mode: %s",
+                      role, ifname, strerror(rc < 0 ? -rc : rc));
         return -1;
     }
-    fprintf(stderr, "[PROFILE-XDP] attach OK %s %s (drv)\n", role, ifname);
-    fflush(stderr);
     return 0;
 }
 
@@ -215,18 +186,21 @@ static int open_bpf_object(const char *path, struct bpf_object **obj_out,
     obj = bpf_object__open_file(open_path, NULL);
 
     if (libbpf_get_error(obj)) {
-        fprintf(stderr, "[PROFILE-XDP] bpf open failed: %s\n", open_path);
+        main_diag_log(MAIN_DIAG_ERROR, "PROFILE-XDP",
+                      "cannot open BPF object %s", open_path);
         return -1;
     }
     if (bpf_object__load(obj) != 0) {
-        fprintf(stderr, "[PROFILE-XDP] bpf load failed: %s\n", open_path);
+        main_diag_log(MAIN_DIAG_ERROR, "PROFILE-XDP",
+                      "cannot load BPF object %s", open_path);
         bpf_object__close(obj);
         return -1;
     }
     struct bpf_program *prog = bpf_object__find_program_by_name(obj, prog_name);
     struct bpf_map *map = bpf_object__find_map_by_name(obj, map_name);
     if (!prog || !map) {
-        fprintf(stderr, "[PROFILE-XDP] bpf object %s missing prog/map\n", open_path);
+        main_diag_log(MAIN_DIAG_ERROR, "PROFILE-XDP",
+                      "BPF object %s is missing program or map", open_path);
         bpf_object__close(obj);
         return -1;
     }
@@ -340,23 +314,19 @@ int profile_iface_xdp_attach_init(struct ne_pair *p, const struct app_config *cf
     if (!p || !cfg)
         return -1;
 
-    fprintf(stderr, "[PROFILE-XDP] cold attach: %d LAN, %d WAN(dp)\n",
-            p->local_count, p->wan_count);
-    fflush(stderr);
-
     for (int i = 0; i < p->local_count; i++) {
         if (profile_iface_xdp_bind_local(p, cfg, i) != 0) {
-            fprintf(stderr, "[PROFILE-XDP] cold attach failed LAN %s (slot %d)\n",
-                    p->locals[i].ifname, i);
-            fflush(stderr);
+            main_diag_log(MAIN_DIAG_ERROR, "PROFILE-XDP",
+                          "cold attach failed for LAN %s (slot %d)",
+                          p->locals[i].ifname, i);
             return -1;
         }
     }
     for (int di = 0; di < p->wan_count; di++) {
         if (profile_iface_xdp_bind_wan(p, cfg, di, cfg->fake_ethertype_ipv4) != 0) {
-            fprintf(stderr, "[PROFILE-XDP] cold attach failed WAN %s (dp %d)\n",
-                    p->wans[di].ifname, di);
-            fflush(stderr);
+            main_diag_log(MAIN_DIAG_ERROR, "PROFILE-XDP",
+                          "cold attach failed for WAN %s (slot %d)",
+                          p->wans[di].ifname, di);
             return -1;
         }
     }
@@ -395,9 +365,8 @@ int profile_iface_xdp_sync_wan_live(struct forwarder *fwd, const struct app_conf
         profile_iface_life_attach_wan_rows(fwd, new_cfg, prof->id, &sess);
         if (sess.validate_failed) {
             profile_iface_life_attach_rollback(fwd, &sess);
-            fprintf(stderr,
-                    "[PROFILE-XDP] profile %d: WAN live attach failed\n",
-                    prof->id);
+            main_diag_log(MAIN_DIAG_ERROR, "PROFILE-XDP",
+                          "profile %d WAN live attach failed", prof->id);
             return -1;
         }
         if (sess.wan_n > 0)

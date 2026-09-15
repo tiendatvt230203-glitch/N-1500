@@ -119,9 +119,6 @@ static void ne_pqc_start_lifetime_clock(struct packet_crypto_ctx *ctx, uint64_t 
     memcpy(ctx->pqc_timed_key, ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ);
     ctx->pqc_key_in_use_ms = now;
     ctx->pqc_rekey_sent = false;
-    fprintf(stderr,
-            "[NE-PQC] Policy %d session key stored in RAM; lifetime clock started.\n",
-            ctx->policy_id);
 }
 
 static void ne_pqc_on_key_material(struct packet_crypto_ctx *ctx)
@@ -208,9 +205,9 @@ void fwd_crypto_pqc_key_lifetime_tick(void)
         policy_crypto_ctx[i].pqc_rekey_sent = true;
         request_ids[nreq++] = policy_crypto_ctx[i].policy_id;
         request_started[nreq - 1] = started;
-        fprintf(stderr,
-                "[NE-PQC] Policy %d session key lifetime expired; requesting PQC handshake for a new key.\n",
-                policy_crypto_ctx[i].policy_id);
+        main_diag_log(MAIN_DIAG_INFO, "NE-PQC",
+                      "policy %d key expired; requesting rekey",
+                      policy_crypto_ctx[i].policy_id);
     }
     pthread_mutex_unlock(&policy_crypto_lock);
 
@@ -403,8 +400,6 @@ int fwd_crypto_rebuild(struct app_config *cfg)
     crypto_runtime_reset_indexes();
     memset(policy_profile_id_by_wire_id, -1, sizeof(policy_profile_id_by_wire_id));
 
-    main_diag_ne_pqc_configure(cfg);
-
     if (cfg) {
         config_refresh_policy_in_table(cfg);
     }
@@ -412,7 +407,6 @@ int fwd_crypto_rebuild(struct app_config *cfg)
     if (!cfg || !cfg->crypto_enabled) {
         policy_crypto_publish_unlock();
         arp_bridge_reload_policies(cfg);
-        main_diag_ne_pqc_publish();
         return 0;
     }
 
@@ -428,9 +422,9 @@ int fwd_crypto_rebuild(struct app_config *cfg)
         active_policies[i] = *cp;
         if (!crypto_policy_is_encrypt(cp)) {
             if (cp->action != POLICY_ACTION_BYPASS)
-                fprintf(stderr,
-                        "[CRYPTO] Policy %d ignored: only L2 PQC and Bypass are supported.\n",
-                        cp->db_id);
+                main_diag_log(MAIN_DIAG_WARN, "CRYPTO",
+                              "policy %d ignored: unsupported action",
+                              cp->db_id);
             continue;
         }
         if (cp->id >= 0 && cp->id <= 255)
@@ -489,20 +483,8 @@ int fwd_crypto_rebuild(struct app_config *cfg)
         }
     }
 
-    for (int i = 0; i < active_policy_count; i++) {
-        if (!policy_crypto_ready[i] ||
-            !policy_crypto_ctx[i].pqc_from_handshake ||
-            !ne_key_nonzero(policy_crypto_ctx[i].keys[KEY_SLOT_CURRENT],
-                            PQC_TRAFFIC_KEY_SZ))
-            continue;
-        main_diag_log_ne_pqc_match(
-            policy_crypto_ctx[i].profile_id,
-            policy_crypto_ctx[i].policy_id,
-            policy_crypto_ctx[i].keys[KEY_SLOT_CURRENT]);
-    }
     policy_crypto_publish_unlock();
     arp_bridge_reload_policies(cfg);
-    main_diag_ne_pqc_publish();
     return 0;
 }
 

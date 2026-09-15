@@ -3,9 +3,9 @@
 #include "../../../inc/core/forwarder/forwarder_wan.h"
 #include "../../../inc/core/iface/interface.h"
 #include "../../../inc/core/iface/profile_iface_xdp.h"
+#include "../../../inc/core/util/main_diag.h"
 
 #include <net/if.h>
-#include <stdio.h>
 #include <string.h>
 
 static int fwd_ensure_mid_wan_rings(struct forwarder *fwd, int di)
@@ -16,9 +16,9 @@ static int fwd_ensure_mid_wan_rings(struct forwarder *fwd, int di)
         if (fwd->mid_to_wan[di][w].cap != 0)
             continue;
         if (ne_ring_init(&fwd->mid_to_wan[di][w], NE_RING, 1) != 0) {
-            fprintf(stderr,
-                    "[PROFILE-LIFE] mid_to_wan ring init failed slot %d worker %d\n",
-                    di, w);
+            main_diag_log(MAIN_DIAG_ERROR, "PROFILE-LIFE",
+                          "mid-to-WAN ring init failed for slot %d worker %d",
+                          di, w);
             return -1;
         }
     }
@@ -127,57 +127,46 @@ void profile_iface_life_attach_wan_rows(struct forwarder *fwd,
             break;
         if (ci < 0 || ci >= new_cfg->wan_count)
             continue;
-        if (!config_wan_live(new_cfg, ci)) {
-            fprintf(stderr,
-                    "[PROFILE-LIFE] profile %d skip WAN %s (not_dataplane)\n",
-                    trigger_profile_id, new_cfg->wans[ci].ifname);
+        if (!config_wan_live(new_cfg, ci))
             continue;
-        }
         ifname = new_cfg->wans[ci].ifname;
         if (if_nametoindex(ifname) == 0) {
-            fprintf(stderr,
-                    "[VALIDATE] profile %d: skip WAN %s (interface not found)\n",
-                    trigger_profile_id, ifname);
+            main_diag_log(MAIN_DIAG_ERROR, "VALIDATE",
+                          "profile %d WAN %s interface not found",
+                          trigger_profile_id, ifname);
             sess->validate_failed = 1;
             continue;
         }
-        if (pair_wan_dp_slot_live(fwd, ifname) >= 0) {
-            fprintf(stderr,
-                    "[PROFILE-LIFE] profile %d skip WAN %s (already_live)\n",
-                    trigger_profile_id, ifname);
+        if (pair_wan_dp_slot_live(fwd, ifname) >= 0)
             continue;
-        }
 
         di = fwd_alloc_wan_slot(fwd);
         if (di < 0) {
-            fprintf(stderr,
-                    "[VALIDATE] profile %d: skip WAN %s (MAX_INTERFACES)\n",
-                    trigger_profile_id, ifname);
+            main_diag_log(MAIN_DIAG_ERROR, "VALIDATE",
+                          "profile %d cannot add WAN %s: interface limit reached",
+                          trigger_profile_id, ifname);
             sess->validate_failed = 1;
             continue;
         }
-        fprintf(stderr, "[PROFILE-LIFE] profile %d ADD WAN %s (dp slot %d)\n",
-                trigger_profile_id, ifname, di);
-        fflush(stderr);
         if (fwd_ensure_mid_wan_rings(fwd, di) != 0) {
-            fprintf(stderr,
-                    "[VALIDATE] profile %d: skip WAN %s (egress ring init failed)\n",
-                    trigger_profile_id, ifname);
+            main_diag_log(MAIN_DIAG_ERROR, "VALIDATE",
+                          "profile %d cannot add WAN %s: egress ring init failed",
+                          trigger_profile_id, ifname);
             sess->validate_failed = 1;
             continue;
         }
         if (ne_pair_plumb_wan_dp(&fwd->pair, new_cfg, ci, di) != 0) {
-            fprintf(stderr,
-                    "[VALIDATE] profile %d: skip WAN %s (plumb/XSK failed)\n",
-                    trigger_profile_id, ifname);
+            main_diag_log(MAIN_DIAG_ERROR, "VALIDATE",
+                          "profile %d cannot add WAN %s: XSK plumb failed",
+                          trigger_profile_id, ifname);
             sess->validate_failed = 1;
             continue;
         }
         if (profile_iface_xdp_bind_wan(&fwd->pair, new_cfg, di,
                                        new_cfg->fake_ethertype_ipv4) != 0) {
-            fprintf(stderr,
-                    "[VALIDATE] profile %d: skip WAN %s (xdp attach/xsk map failed)\n",
-                    trigger_profile_id, ifname);
+            main_diag_log(MAIN_DIAG_ERROR, "VALIDATE",
+                          "profile %d cannot add WAN %s: XDP attach/map failed",
+                          trigger_profile_id, ifname);
             ne_pair_unplumb_wan_dp(&fwd->pair, di);
             sess->validate_failed = 1;
             continue;

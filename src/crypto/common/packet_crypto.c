@@ -1,6 +1,5 @@
 #include "../../../inc/crypto/packet_crypto.h"
 #include "../../../inc/core/util/main_diag.h"
-
 #include "scrypt.h"
 #include <stdio.h>
 #include <string.h>
@@ -145,9 +144,9 @@ int packet_crypto_encrypt(struct packet_crypto_ctx *ctx,
     if (!key_nonzero(key, AES_MAX_KEY_SIZE)) {
         if (ctx->pqc_from_handshake && !tls_zero_key_logged[ctx->wire_id]) {
             tls_zero_key_logged[ctx->wire_id] = 1;
-            fprintf(stderr,
-                    "[PQC-KEY] invalid CURRENT key for profile=%d policy=%d; blocking L2 crypto\n",
-                    ctx->profile_id, ctx->policy_id);
+            main_diag_log(MAIN_DIAG_ERROR, "PQC-KEY",
+                          "invalid current key for profile=%d policy=%d; blocking L2 crypto",
+                          ctx->profile_id, ctx->policy_id);
         }
         return -1;
     }
@@ -263,8 +262,6 @@ static void pqc_clear_ctx_keys(struct packet_crypto_ctx *ctx)
 {
     if (!ctx)
         return;
-    if (ctx->pqc_from_handshake && ctx->profile_id > 0 && ctx->policy_id > 0)
-        main_diag_ne_pqc_clear(ctx->profile_id, ctx->policy_id);
     wipe_key_bytes(ctx->keys[KEY_SLOT_PREV], PQC_TRAFFIC_KEY_SZ);
     wipe_key_bytes(ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ);
     wipe_key_bytes(ctx->keys[KEY_SLOT_NEXT], PQC_TRAFFIC_KEY_SZ);
@@ -275,9 +272,6 @@ static int pqc_load_handshake_slots(struct packet_crypto_ctx *ctx)
     uint8_t slots[KEY_SLOT_COUNT][PQC_TRAFFIC_KEY_SZ];
     uint8_t key_ids[KEY_SLOT_COUNT];
     bool valid[KEY_SLOT_COUNT];
-    uint8_t old_current[PQC_TRAFFIC_KEY_SZ];
-
-    memcpy(old_current, ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ);
     if (sig_pqc_get_keys(ctx->policy_id, slots, key_ids, valid) != 0)
         return -1;
 
@@ -287,11 +281,6 @@ static int pqc_load_handshake_slots(struct packet_crypto_ctx *ctx)
         else
             wipe_key_bytes(ctx->keys[slot], PQC_TRAFFIC_KEY_SZ);
     }
-    if (key_nonzero(ctx->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ) &&
-        memcmp(old_current, ctx->keys[KEY_SLOT_CURRENT],
-               PQC_TRAFFIC_KEY_SZ) != 0)
-        main_diag_log_ne_pqc_match(ctx->profile_id, ctx->policy_id,
-                                   ctx->keys[KEY_SLOT_CURRENT]);
     return 0;
 }
 

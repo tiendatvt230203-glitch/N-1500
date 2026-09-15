@@ -37,10 +37,6 @@ void mac_learn_persist(struct forwarder *fwd);
 void mac_learn_restore(struct forwarder *fwd);
 void mac_learn_tick(struct forwarder *fwd);
 
-/* Một bảng hệ thống: LAN/WAN + bridge + mac + WAN UP/DOWN. Bảng mới nhất = đang dùng. */
-void mac_learn_log_runtime_table(struct forwarder *fwd, const struct app_config *cfg,
-                                 const char *event);
-
 /*
  * L2 FDB: one client MAC per LAN ifname (replace on learn).
  * Chỉ học SMAC từ ARP Request của client cắm dây (arp_bridge_from_local).

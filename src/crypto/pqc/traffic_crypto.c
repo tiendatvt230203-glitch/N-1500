@@ -1,8 +1,8 @@
 #include "traffic_crypto.h"
 #include "../../inc/crypto/scrypt.h"
+#include "../../../inc/core/util/main_diag.h"
 #include <string.h>
 #include <stdlib.h>
-#include <stdio.h>
 #include <stdint.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -24,7 +24,8 @@ int trf_pqc_init_global() {
     
     int ret = scrypt_Init();
     if (ret != 0) {
-        fprintf(stderr, "[PQC-INIT] scrypt_Init failed: %s\n", scrypt_ErrorString(ret));
+        main_diag_log(MAIN_DIAG_FATAL, "PQC", "scrypt init failed: %s",
+                      scrypt_ErrorString(ret));
         return TRF_PQC_ERR_INIT;
     }
     
@@ -36,7 +37,8 @@ int trf_pqc_generate_random_key(byte* out, int len) {
     if (!out || len <= 0) return TRF_PQC_ERR_CRYPTO;
     int ret = scrypt_RandomBytes(out, (word32)len);
     if (ret != 0) {
-        fprintf(stderr, "[PQC-RAND] Failed to generate random bytes: %s\n", scrypt_ErrorString(ret));
+        main_diag_log(MAIN_DIAG_ERROR, "PQC", "random generation failed: %s",
+                      scrypt_ErrorString(ret));
         return TRF_PQC_ERR_CRYPTO;
     }
     return TRF_PQC_OK;
@@ -138,7 +140,8 @@ int trf_save_key_to_file(const char *filename, const char *data, int mode) {
     ssize_t written = write(fd, data, strlen(data));
     ssize_t bytes_write = write(fd, "\n", 1);
     if (bytes_write < 0) {
-        perror("Canot write to file: ");
+        main_diag_log(MAIN_DIAG_ERROR, "PQC", "cannot write key file %s",
+                      filename);
     }
     close(fd);
     return (written > 0) ? 0 : -1;
@@ -207,7 +210,8 @@ static void* get_aligned_library_obj(void* (*new_func)(), void (*free_func)(void
     }
 
     if (!aligned_ptr) {
-        fprintf(stderr, "[PQC] Critical: Failed to get aligned object after 1024 attempts\n");
+        main_diag_log(MAIN_DIAG_FATAL, "PQC",
+                      "cannot allocate aligned crypto object");
     }
     return aligned_ptr;
 }
@@ -321,9 +325,6 @@ int trf_dsa_generate_keys(byte* pub_key_out, int* pub_sz, byte* priv_key_out, in
     int written_pub = scrypt_MlDsaExportPublicKey(key_obj, pub_key_out, *pub_sz);
     int written_priv = scrypt_MlDsaExportPrivateKey(key_obj, priv_key_out, *priv_sz);
 
-    printf("[DEBUG-DSA] Export Done: Pub=%d/%d, Priv=%d/%d\n", 
-            written_pub, *pub_sz, written_priv, *priv_sz);
-
     // CRITICAL FIX: The library gave us 7488 for size but only wrote 4896.
     // We MUST use the actual written size for subsequent imports.
     *priv_sz = written_priv;
@@ -349,8 +350,9 @@ int trf_dsa_sign_payload(const byte* priv_key_in, int priv_sz,
     int ret_import = scrypt_MlDsaImportPrivateKey(key_obj, priv_key_in, priv_sz, MLDSA_LEVEL_5);
     
     if (ret_import != 0) {
-        fprintf(stderr, "[FAIL] DSA Import Private Key failed with code: %d (Size: %d, Level: %d)\n", 
-                ret_import, priv_sz, MLDSA_LEVEL_5);
+        main_diag_log(MAIN_DIAG_ERROR, "PQC",
+                      "DSA private-key import failed: code=%d size=%d level=%d",
+                      ret_import, priv_sz, MLDSA_LEVEL_5);
         scrypt_MlDsaKeyFree(key_obj);
         return TRF_PQC_ERR_SIG;
     }
@@ -359,7 +361,7 @@ int trf_dsa_sign_payload(const byte* priv_key_in, int priv_sz,
     int ret = scrypt_MlDsaSign(key_obj, data, len, sig_out, max_sig_sz);
     
     if (ret < 0) {
-        fprintf(stderr, "[FAIL] DSA Signing failed with code: %d\n", ret);
+        main_diag_log(MAIN_DIAG_ERROR, "PQC", "DSA signing failed: code=%d", ret);
         scrypt_MlDsaKeyFree(key_obj);
         return TRF_PQC_ERR_SIG;
     }
@@ -377,29 +379,15 @@ int trf_dsa_verify_payload(const byte* pub_key_in, int pub_sz,
     
     if (!key_obj) return TRF_PQC_ERR_INIT;
 
-    // fprintf(stderr, "[DEBUG-VERIFY] Entering trf_dsa_verify_payload...\n");
-    // fprintf(stderr, "[DEBUG-VERIFY] pub_sz = %d, len = %d, sig_sz = %d\n", pub_sz, len, sig_sz);
-
-    // Calculate fingerprint of incoming public key to verify
-    uint8_t hash[64];
-    trf_calculate_digest(DIGEST_TYPE_SHA256, pub_key_in, pub_sz, hash);
-    char fingerprint[16];
-    for(int i=0; i<4; i++) sprintf(fingerprint + i*2, "%02x", hash[i]);
-    // fprintf(stderr, "[DEBUG-VERIFY] Key fingerprint to verify: %s\n", fingerprint);
-
     int import_ret = scrypt_MlDsaImportPublicKey(key_obj, pub_key_in, pub_sz, MLDSA_LEVEL_5);
     if (import_ret != 0) {
-        fprintf(stderr, "[DEBUG-VERIFY] scrypt_MlDsaImportPublicKey failed: %d\n", import_ret);
+        main_diag_log(MAIN_DIAG_ERROR, "PQC",
+                      "DSA public-key import failed: code=%d", import_ret);
         scrypt_MlDsaKeyFree(key_obj);
         return TRF_PQC_ERR_SIG;
     }
 
     int ret = scrypt_MlDsaVerify(key_obj, data, len, sig_in, sig_sz);
-    // if (ret != 0) {
-    //     fprintf(stderr, "[DEBUG-VERIFY] scrypt_MlDsaVerify failed: %d\n", ret);
-    // } else {
-    //     fprintf(stderr, "[DEBUG-VERIFY] scrypt_MlDsaVerify SUCCESS\n");
-    // }
     scrypt_MlDsaKeyFree(key_obj);
     return (ret == 0) ? TRF_PQC_OK : TRF_PQC_ERR_SIG;
 }
@@ -423,7 +411,8 @@ int trf_pqc_setup_session(const byte* local_priv_dsa, int local_priv_dsa_sz,
     // 1. ML-KEM: Encapsulate to get shared secret and capsule
     ret = trf_kem_encapsulate(remote_pub_kem, remote_pub_kem_sz, capsule, &capsule_sz, shared_secret);
     if (ret != TRF_PQC_OK) {
-        fprintf(stderr, "[PQC-KEM] Encapsulation failed: %s\n", scrypt_ErrorString(ret));
+        main_diag_log(MAIN_DIAG_ERROR, "PQC", "KEM encapsulation failed: %s",
+                      scrypt_ErrorString(ret));
         return TRF_PQC_ERR_CRYPTO;
     }
 
@@ -432,21 +421,24 @@ int trf_pqc_setup_session(const byte* local_priv_dsa, int local_priv_dsa_sz,
     int sig_sz = 0;
     ret = trf_dsa_sign_payload(local_priv_dsa, local_priv_dsa_sz, capsule, capsule_sz, signature, &sig_sz);
     if (ret != TRF_PQC_OK) {
-        fprintf(stderr, "[PQC-DSA] Signing failed: %s\n", scrypt_ErrorString(ret));
+        main_diag_log(MAIN_DIAG_ERROR, "PQC", "DSA signing failed: %s",
+                      scrypt_ErrorString(ret));
         return TRF_PQC_ERR_SIG;
     }
 
     // 3. Verification: Simulate remote verification
     ret = trf_dsa_verify_payload(remote_pub_dsa, remote_pub_dsa_sz, capsule, capsule_sz, signature, sig_sz);
     if (ret != TRF_PQC_OK) {
-        fprintf(stderr, "[PQC-DSA] Signature verification failed: %s\n", scrypt_ErrorString(ret));
+        main_diag_log(MAIN_DIAG_ERROR, "PQC", "signature verification failed: %s",
+                      scrypt_ErrorString(ret));
         return TRF_PQC_ERR_SIG;
     }
 
     // 4. HKDF: Expand shared secret into Session Keys
     ret = trf_derive_session_keys(shared_secret, ss_sz, session_out->tx_key, session_out->rx_key);
     if (ret != TRF_PQC_OK) {
-        fprintf(stderr, "[PQC-HKDF] Key derivation failed: %s\n", scrypt_ErrorString(ret));
+        main_diag_log(MAIN_DIAG_ERROR, "PQC", "key derivation failed: %s",
+                      scrypt_ErrorString(ret));
         return TRF_PQC_ERR_CRYPTO;
     }
 

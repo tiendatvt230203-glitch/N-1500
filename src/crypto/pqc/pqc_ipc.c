@@ -14,6 +14,7 @@
 #include "traffic_crypto.h"
 #include "pqc_vault.h"
 #include "core/forwarder/forwarder_crypto_runtime.h"
+#include "core/util/main_diag.h"
 
 #define IPC_SOCKET_PATH "/var/run/test_network-encryptor.sock"
 
@@ -40,7 +41,8 @@ static void *ipc_listener_thread_main(void *arg) {
 
     int listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (listen_fd < 0) {
-        perror("[IPC] socket failed");
+        main_diag_log(MAIN_DIAG_ERROR, "PQC-IPC",
+                      "socket failed: %s", strerror(errno));
         return NULL;
     }
 
@@ -50,20 +52,20 @@ static void *ipc_listener_thread_main(void *arg) {
     strncpy(addr.sun_path, IPC_SOCKET_PATH, sizeof(addr.sun_path) - 1);
 
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("[IPC] bind failed");
+        main_diag_log(MAIN_DIAG_ERROR, "PQC-IPC",
+                      "bind failed: %s", strerror(errno));
         close(listen_fd);
         return NULL;
     }
 
     if (listen(listen_fd, 5) < 0) {
-        perror("[IPC] listen failed");
+        main_diag_log(MAIN_DIAG_ERROR, "PQC-IPC",
+                      "listen failed: %s", strerror(errno));
         close(listen_fd);
         return NULL;
     }
 
     chmod(IPC_SOCKET_PATH, 0660);
-
-    fprintf(stderr, "[IPC] Listening on Unix Socket: %s\n", IPC_SOCKET_PATH);
 
     while (1) {
         int client_fd = accept(listen_fd, NULL, NULL);
@@ -81,9 +83,9 @@ static void *ipc_listener_thread_main(void *arg) {
                 char resp_buf[1024];
                 memset(resp_buf, 0, sizeof(resp_buf));
                 sig_pqc_trigger_retry_with_info(policy_id, resp_buf, sizeof(resp_buf) - 1);
-                if (write(client_fd, resp_buf, strlen(resp_buf)) < 0) {
-                    perror("write");
-                }
+                if (write(client_fd, resp_buf, strlen(resp_buf)) < 0)
+                    main_diag_log(MAIN_DIAG_WARN, "PQC-IPC",
+                                  "response write failed: %s", strerror(errno));
             } else if (sscanf(buf, "TIMEKEY %d", &policy_id) == 1) {
                 char resp_buf[256];
 
@@ -94,11 +96,12 @@ static void *ipc_listener_thread_main(void *arg) {
                     snprintf(resp_buf, sizeof(resp_buf),
                              "ERROR: cannot read PQC key times\n");
                 if (write(client_fd, resp_buf, strlen(resp_buf)) < 0)
-                    perror("write");
+                    main_diag_log(MAIN_DIAG_WARN, "PQC-IPC",
+                                  "response write failed: %s", strerror(errno));
             } else {
-                if (write(client_fd, "ERROR: invalid command\n", 23) < 0) {
-                    perror("write");
-                }
+                if (write(client_fd, "ERROR: invalid command\n", 23) < 0)
+                    main_diag_log(MAIN_DIAG_WARN, "PQC-IPC",
+                                  "response write failed: %s", strerror(errno));
             }
         }
         close(client_fd);
@@ -131,14 +134,15 @@ int sig_pqc_handle_ipc_cli(int argc, char **argv) {
         char *end = NULL;
         long parsed = strtol(argv[2], &end, 10);
         if (!end || *end != '\0' || parsed <= 0 || parsed > INT_MAX) {
-            fprintf(stderr, "[PQC-CLI] Invalid policy_id.\n");
+            main_diag_log(MAIN_DIAG_ERROR, "PQC-CLI", "invalid policy id");
             return 1;
         }
         policy_id = (int)parsed;
 
         client_fd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (client_fd < 0) {
-            perror("[PQC-CLI] Failed to create socket");
+            main_diag_log(MAIN_DIAG_ERROR, "PQC-CLI",
+                          "socket failed: %s", strerror(errno));
             return 1;
         }
 
@@ -148,14 +152,16 @@ int sig_pqc_handle_ipc_cli(int argc, char **argv) {
         strncpy(addr.sun_path, IPC_SOCKET_PATH, sizeof(addr.sun_path) - 1);
 
         if (connect(client_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-            fprintf(stderr, "[PQC-CLI] Daemon is not running.\n");
+            main_diag_log(MAIN_DIAG_ERROR, "PQC-CLI",
+                          "daemon is not running");
             close(client_fd);
             return 1;
         }
 
         snprintf(msg, sizeof(msg), "TIMEKEY %d\n", policy_id);
         if (write(client_fd, msg, strlen(msg)) < 0) {
-            perror("[PQC-CLI] write");
+            main_diag_log(MAIN_DIAG_ERROR, "PQC-CLI",
+                          "write failed: %s", strerror(errno));
             close(client_fd);
             return 1;
         }
@@ -170,7 +176,7 @@ int sig_pqc_handle_ipc_cli(int argc, char **argv) {
                 fputc('\n', stdout);
             return 0;
         }
-        fprintf(stderr, "[PQC-CLI] No response for -tk.\n");
+        main_diag_log(MAIN_DIAG_ERROR, "PQC-CLI", "no response for -tk");
         return 1;
     }
 
@@ -178,7 +184,8 @@ int sig_pqc_handle_ipc_cli(int argc, char **argv) {
         int policy_id = atoi(argv[2]);
         int client_fd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (client_fd < 0) {
-            perror("[PQC-CLI] Failed to create socket");
+            main_diag_log(MAIN_DIAG_ERROR, "PQC-CLI",
+                          "socket failed: %s", strerror(errno));
             return -1;
         }
 
@@ -188,7 +195,8 @@ int sig_pqc_handle_ipc_cli(int argc, char **argv) {
         strncpy(addr.sun_path, IPC_SOCKET_PATH, sizeof(addr.sun_path) - 1);
 
         if (connect(client_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-            perror("[PQC-CLI] Failed to connect to IPC server");
+            main_diag_log(MAIN_DIAG_ERROR, "PQC-CLI",
+                          "IPC connect failed: %s", strerror(errno));
             close(client_fd);
             return -1;
         }
@@ -196,7 +204,8 @@ int sig_pqc_handle_ipc_cli(int argc, char **argv) {
         char msg[128];
         snprintf(msg, sizeof(msg), "RETRY %d\n", policy_id);
         if (pqc_ipc_write_all(client_fd, msg, strlen(msg)) != 0) {
-            perror("[PQC-CLI] Failed to send retry request");
+            main_diag_log(MAIN_DIAG_ERROR, "PQC-CLI",
+                          "retry request failed: %s", strerror(errno));
             close(client_fd);
             return -1;
         }
@@ -239,8 +248,6 @@ void sig_pqc_handle_gen_identity(void) {
         char fingerprint[16];
         for (int i = 0; i < 4; i++) sprintf(fingerprint + i * 2, "%02x", hash[i]);
 
-        // printf("[PQC-GI] Success! Generated Fingerprint: %s\n", fingerprint);
-
         // Export directly to HashiCorp Vault (Vault is the only persistent storage)
         char key_filename[64];
         snprintf(key_filename, sizeof(key_filename), "%s.key", fingerprint);
@@ -250,12 +257,14 @@ void sig_pqc_handle_gen_identity(void) {
             printf("[PQC-GI] Public Key Exported: kv/PQC_Key/local_public/%s\n", key_filename);
             printf("[PQC-GI] Successfully exported identity [%s] to HashiCorp Vault (kv/PQC_Key/local_public & local_private).\n", fingerprint);
         } else {
-            fprintf(stderr, "[PQC-GI] WARNING: Failed to export identity [%s] to HashiCorp Vault.\n", fingerprint);
+            main_diag_log(MAIN_DIAG_WARN, "PQC-GI",
+                          "failed to export identity %s to Vault", fingerprint);
         }
         
         free(b64_priv);
         free(b64_pub);
     } else {
-        fprintf(stderr, "[PQC-GI] ERROR: Failed to generate identity keys!\n");
+        main_diag_log(MAIN_DIAG_ERROR, "PQC-GI",
+                      "failed to generate identity keys");
     }
 }

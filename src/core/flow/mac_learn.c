@@ -1,9 +1,9 @@
 #include "../../../inc/core/flow/mac_learn.h"
 #include "../../../inc/core/forwarder/forwarder.h"
 #include "../../../inc/core/util/config.h"
+#include "../../../inc/core/util/main_diag.h"
 #include "../../../inc/core/iface/interface.h"
 #include "../../../inc/core/dataplane/dataplane_util.h"
-#include "../../../inc/core/failover/cfm_diag.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -14,7 +14,6 @@
 #include <sys/ioctl.h>
 #include <net/if.h>
 
-#define MAC_PURGE_LOG_INTERVAL_MS 10000ull
 #define MAC_LAN_LOG_DIR           "/var/log/NE"
 #define MAC_LAN_LOG_PATH          MAC_LAN_LOG_DIR "/mac_lan.log"
 #define MAC_LAN_LOG_TMP           MAC_LAN_LOG_DIR "/mac_lan.log.tmp"
@@ -25,10 +24,6 @@ enum mac_upsert_result {
     MAC_UPSERT_NEW,
     MAC_UPSERT_MOVE,
 };
-
-static uint64_t g_last_purge_log_ms;
-static uint64_t g_last_mismatch_log_ms;
-static pthread_mutex_t g_mac_table_log_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void mac_fdb_persist_save_locked(const struct mac_learn_table *t,
                                         const struct forwarder *fwd);
@@ -43,211 +38,6 @@ static int mac_is_local_iface_locked(const struct mac_learn_table *t,
 static void purge_local_iface_macs_locked(struct mac_learn_table *t);
 static void enforce_one_mac_per_ifname_locked(struct mac_learn_table *t);
 static int ingress_idx_by_ifname(const struct forwarder *fwd, const char *ifname);
-
-/* Bridge name for a LAN ifname (same idea as main_diag iface table). */
-static const char *mac_bridge_for_lan_ifname(const struct forwarder *fwd,
-                                              const char *ifname)
-{
-    int local_idx = -1;
-
-    if (!fwd || !fwd->cfg || !ifname || !ifname[0])
-        return "-";
-    for (int i = 0; i < fwd->cfg->local_count; i++) {
-        if (strcmp(fwd->cfg->locals[i].ifname, ifname) == 0) {
-            local_idx = i;
-            break;
-        }
-    }
-    if (local_idx < 0)
-        return "-";
-    if (fwd->cfg->profile_count > 0) {
-        const struct profile_config *p = &fwd->cfg->profiles[0];
-
-        for (int bi = 0; bi < p->bridge_count; bi++) {
-            if (p->bridges[bi].local_idx == local_idx && p->bridges[bi].ifname[0])
-                return p->bridges[bi].ifname;
-        }
-    }
-    return "-";
-}
-
-static void mac_tbl_hline(void)
-{
-    fprintf(stderr,
-            "+------+--------------+----------+-------------------+--------+\n");
-}
-
-/*
- * Một bảng hệ thống duy nhất (ngoài [policies]):
- *   role | interface | bridge | mac | state
- * LAN: mac từ FDB (hoặc "-" nếu chưa học). WAN: peer MAC + UP/DOWN từ CFM.
- * Bảng in lần mới nhất = snapshot đang dùng của hệ thống.
- */
-void mac_learn_log_runtime_table(struct forwarder *fwd, const struct app_config *cfg,
-                                 const char *event)
-{
-    struct cfm_wan_snap wan_rows[CFM_WAN_SNAP_MAX];
-    int wan_n;
-    int lan_n = 0;
-    struct mac_learn_entry lan_copy[MAC_LEARN_MAX_ENTRIES];
-    int printed = 0;
-
-    pthread_mutex_lock(&g_mac_table_log_lock);
-
-    if (!cfg && fwd)
-        cfg = fwd->cfg;
-
-    if (fwd) {
-        pthread_spin_lock(&fwd->mac_table.lock);
-        lan_n = fwd->mac_table.count;
-        if (lan_n > MAC_LEARN_MAX_ENTRIES)
-            lan_n = MAC_LEARN_MAX_ENTRIES;
-        if (lan_n > 0)
-            memcpy(lan_copy, fwd->mac_table.list, (size_t)lan_n * sizeof(lan_copy[0]));
-        pthread_spin_unlock(&fwd->mac_table.lock);
-    }
-
-    wan_n = cfm_snapshot_wan_peers(wan_rows, CFM_WAN_SNAP_MAX);
-    if (wan_n < 0)
-        wan_n = 0;
-
-    fprintf(stderr, "\n  [system] processing: %s\n", event ? event : "update");
-    mac_tbl_hline();
-    fprintf(stderr,
-            "| %-4s | %-12s | %-8s | %-17s | %-6s |\n",
-            "role", "interface", "bridge", "mac", "state");
-    mac_tbl_hline();
-
-    if (cfg) {
-        for (int li = 0; li < cfg->local_count; li++) {
-            const char *ifname = cfg->locals[li].ifname;
-            const char *br = "-";
-            int any = 0;
-
-            if (!ifname[0])
-                continue;
-            if (fwd)
-                br = mac_bridge_for_lan_ifname(fwd, ifname);
-            else if (cfg->profile_count > 0) {
-                const struct profile_config *p = &cfg->profiles[0];
-
-                for (int bi = 0; bi < p->bridge_count; bi++) {
-                    if (p->bridges[bi].local_idx == li &&
-                        p->bridges[bi].ifname[0]) {
-                        br = p->bridges[bi].ifname;
-                        break;
-                    }
-                }
-            }
-            for (int i = 0; i < lan_n; i++) {
-                char mac_s[24];
-
-                if (strcmp(lan_copy[i].ifname, ifname) != 0)
-                    continue;
-                any = 1;
-                snprintf(mac_s, sizeof(mac_s),
-                         "%02x:%02x:%02x:%02x:%02x:%02x",
-                         lan_copy[i].mac[0], lan_copy[i].mac[1],
-                         lan_copy[i].mac[2], lan_copy[i].mac[3],
-                         lan_copy[i].mac[4], lan_copy[i].mac[5]);
-                fprintf(stderr,
-                        "| %-4s | %-12s | %-8s | %-17s | %-6s |\n",
-                        "lan", ifname, br, mac_s, "-");
-                printed++;
-            }
-            if (!any) {
-                fprintf(stderr,
-                        "| %-4s | %-12s | %-8s | %-17s | %-6s |\n",
-                        "lan", ifname, br, "-", "-");
-                printed++;
-            }
-        }
-    } else {
-        for (int i = 0; i < lan_n; i++) {
-            char mac_s[24];
-            const char *br = mac_bridge_for_lan_ifname(fwd, lan_copy[i].ifname);
-
-            snprintf(mac_s, sizeof(mac_s),
-                     "%02x:%02x:%02x:%02x:%02x:%02x",
-                     lan_copy[i].mac[0], lan_copy[i].mac[1], lan_copy[i].mac[2],
-                     lan_copy[i].mac[3], lan_copy[i].mac[4], lan_copy[i].mac[5]);
-            fprintf(stderr,
-                    "| %-4s | %-12s | %-8s | %-17s | %-6s |\n",
-                    "lan",
-                    lan_copy[i].ifname[0] ? lan_copy[i].ifname : "-",
-                    br, mac_s, "-");
-            printed++;
-        }
-    }
-
-    if (wan_n > 0) {
-        for (int i = 0; i < wan_n; i++) {
-            char mac_s[24];
-
-            if (wan_rows[i].mac_learned) {
-                snprintf(mac_s, sizeof(mac_s),
-                         "%02x:%02x:%02x:%02x:%02x:%02x",
-                         wan_rows[i].peer_mac[0], wan_rows[i].peer_mac[1],
-                         wan_rows[i].peer_mac[2], wan_rows[i].peer_mac[3],
-                         wan_rows[i].peer_mac[4], wan_rows[i].peer_mac[5]);
-            } else {
-                snprintf(mac_s, sizeof(mac_s), "-");
-            }
-            fprintf(stderr,
-                    "| %-4s | %-12s | %-8s | %-17s | %-6s |\n",
-                    "wan",
-                    wan_rows[i].ifname[0] ? wan_rows[i].ifname : "-",
-                    wan_rows[i].bridge[0] ? wan_rows[i].bridge : "-",
-                    mac_s,
-                    wan_rows[i].is_up ? "UP" : "DOWN");
-            printed++;
-        }
-    } else if (cfg) {
-        for (int i = 0; i < cfg->wan_count; i++) {
-            const char *ifname = cfg->wans[i].ifname;
-            const char *br = "-";
-            int wan_dp;
-
-            if (!ifname[0] || !cfg->wans[i].dataplane)
-                continue;
-            wan_dp = config_wan_cfg_to_dp(cfg, i);
-            if (cfg->profile_count > 0) {
-                const struct profile_config *p = &cfg->profiles[0];
-
-                for (int bi = 0; bi < p->bridge_count; bi++) {
-                    if (p->bridges[bi].wan_dp == wan_dp &&
-                        p->bridges[bi].ifname[0]) {
-                        br = p->bridges[bi].ifname;
-                        break;
-                    }
-                }
-            }
-            fprintf(stderr,
-                    "| %-4s | %-12s | %-8s | %-17s | %-6s |\n",
-                    "wan", ifname, br, "-", "-");
-            printed++;
-        }
-    }
-
-    if (!printed) {
-        fprintf(stderr,
-                "| %-4s | %-12s | %-8s | %-17s | %-6s |\n",
-                "-", "-", "-", "(empty)", "-");
-    }
-    mac_tbl_hline();
-    fflush(stderr);
-    pthread_mutex_unlock(&g_mac_table_log_lock);
-}
-
-/* Caller already holds mac_table.lock — only used from learn/purge/restore paths. */
-static void log_mac_runtime_table_from_locked(struct forwarder *fwd, const char *event)
-{
-    if (fwd)
-        pthread_spin_unlock(&fwd->mac_table.lock);
-    mac_learn_log_runtime_table(fwd, fwd ? fwd->cfg : NULL, event);
-    if (fwd)
-        pthread_spin_lock(&fwd->mac_table.lock);
-}
 
 static uint64_t monotonic_ms(void)
 {
@@ -395,7 +185,8 @@ static enum mac_upsert_result upsert_locked(struct mac_learn_table *t, const cha
     }
 
     if (t->count >= MAC_LEARN_MAX_ENTRIES) {
-        fprintf(stderr, "[MAC] table full on %s\n", ifname ? ifname : "-");
+        main_diag_log(MAIN_DIAG_WARN, "MAC", "table full on %s",
+                      ifname ? ifname : "-");
         return MAC_UPSERT_REFRESH;
     }
 
@@ -423,8 +214,6 @@ static void table_learn(struct forwarder *fwd, struct mac_learn_table *t,
                         enum mac_learn_src src)
 {
     enum mac_upsert_result r;
-    char old_ifname[IF_NAMESIZE];
-    uint8_t old_mac[MAC_LEN] = {0};
     int replaced = 0;
 
     if (!t || !ifname || !mac || ifname[0] == '\0')
@@ -443,44 +232,12 @@ static void table_learn(struct forwarder *fwd, struct mac_learn_table *t,
     for (int i = 0; i < t->count; i++) {
         if (strcmp(t->list[i].ifname, ifname) == 0 &&
             memcmp(t->list[i].mac, mac, MAC_LEN) != 0) {
-            memcpy(old_mac, t->list[i].mac, MAC_LEN);
             replaced = 1;
             break;
         }
     }
 
-    r = upsert_locked(t, ifname, mac, old_ifname);
-
-    if (r == MAC_UPSERT_NEW || replaced) {
-        char ev[160];
-
-        if (replaced) {
-            snprintf(ev, sizeof(ev),
-                     "learn if=%s mac=%02x:%02x:%02x:%02x:%02x:%02x "
-                     "replace=%02x:%02x:%02x:%02x:%02x:%02x",
-                     ifname,
-                     (unsigned)mac[0], (unsigned)mac[1], (unsigned)mac[2],
-                     (unsigned)mac[3], (unsigned)mac[4], (unsigned)mac[5],
-                     (unsigned)old_mac[0], (unsigned)old_mac[1],
-                     (unsigned)old_mac[2], (unsigned)old_mac[3],
-                     (unsigned)old_mac[4], (unsigned)old_mac[5]);
-        } else {
-            snprintf(ev, sizeof(ev),
-                     "learn if=%s mac=%02x:%02x:%02x:%02x:%02x:%02x",
-                     ifname,
-                     (unsigned)mac[0], (unsigned)mac[1], (unsigned)mac[2],
-                     (unsigned)mac[3], (unsigned)mac[4], (unsigned)mac[5]);
-        }
-        log_mac_runtime_table_from_locked(fwd, ev);
-    } else if (r == MAC_UPSERT_MOVE) {
-        char ev[128];
-
-        snprintf(ev, sizeof(ev),
-                 "move if=%s->%s mac=%02x:%02x:%02x:%02x:%02x:%02x",
-                 old_ifname[0] ? old_ifname : "-", ifname,
-                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-        log_mac_runtime_table_from_locked(fwd, ev);
-    }
+    r = upsert_locked(t, ifname, mac, NULL);
     if (r == MAC_UPSERT_NEW || r == MAC_UPSERT_MOVE || replaced)
         mac_fdb_persist_save_locked(t, fwd);
     pthread_spin_unlock(&t->lock);
@@ -712,18 +469,12 @@ static void mac_fdb_persist_save_locked(const struct mac_learn_table *t,
     FILE *out;
     char line[256];
     int fd;
-    int kept_orphan = 0;
 
     if (!t || mac_fdb_ensure_log_dir() != 0)
         return;
 
-    if (t->count == 0 && mac_fdb_log_has_entries() > 0) {
-        fprintf(stderr,
-                "[MAC-FDB] persist skip empty RAM — keep existing %s\n",
-                MAC_LAN_LOG_PATH);
-        fflush(stderr);
+    if (t->count == 0 && mac_fdb_log_has_entries() > 0)
         return;
-    }
 
     /* Seed from on-disk log. */
     fp = fopen(MAC_LAN_LOG_PATH, "r");
@@ -789,8 +540,6 @@ static void mac_fdb_persist_save_locked(const struct mac_learn_table *t,
                 }
             }
             if (in_ram || !ifname_in_configured_locals(fwd, merged[i].ifname)) {
-                if (!in_ram)
-                    kept_orphan++;
                 if (w != i)
                     merged[w] = merged[i];
                 w++;
@@ -801,8 +550,9 @@ static void mac_fdb_persist_save_locked(const struct mac_learn_table *t,
 
     out = fopen(MAC_LAN_LOG_TMP, "w");
     if (!out) {
-        fprintf(stderr, "[MAC-FDB] persist FAIL write %s\n", MAC_LAN_LOG_TMP);
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_ERROR, "MAC-FDB",
+                      "cannot write %s: %s", MAC_LAN_LOG_TMP,
+                      strerror(errno));
         return;
     }
     fprintf(out,
@@ -821,13 +571,11 @@ static void mac_fdb_persist_save_locked(const struct mac_learn_table *t,
         (void)fsync(fd);
     fclose(out);
     if (rename(MAC_LAN_LOG_TMP, MAC_LAN_LOG_PATH) != 0) {
-        fprintf(stderr, "[MAC-FDB] persist FAIL rename -> %s\n", MAC_LAN_LOG_PATH);
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_ERROR, "MAC-FDB",
+                      "cannot rename %s to %s: %s", MAC_LAN_LOG_TMP,
+                      MAC_LAN_LOG_PATH, strerror(errno));
         return;
     }
-    fprintf(stderr, "[MAC-FDB] saved %d (ram=%d orphan_kept=%d) -> %s\n",
-            merged_count, t->count, kept_orphan, MAC_LAN_LOG_PATH);
-    fflush(stderr);
 }
 
 static int mac_fdb_persist_load_locked(struct mac_learn_table *t,
@@ -962,62 +710,14 @@ static void table_purge_orphan_locked(struct mac_learn_table *t, struct forwarde
     }
 }
 
-static void log_index_space_mismatch(struct forwarder *fwd)
-{
-    uint64_t now_ms;
-    int cfg_n;
-
-    if (!fwd || !fwd->cfg)
-        return;
-    cfg_n = fwd->cfg->local_count;
-    if (fwd->local_count == cfg_n)
-        return;
-
-    now_ms = monotonic_ms();
-    if (now_ms - g_last_mismatch_log_ms < MAC_PURGE_LOG_INTERVAL_MS)
-        return;
-    g_last_mismatch_log_ms = now_ms;
-
-    fprintf(stderr,
-            "[MAC] index-space fwd_local_count=%d cfg_local_count=%d table=%d\n",
-            fwd->local_count, cfg_n, fwd->mac_table.count);
-    for (int i = 0; i < fwd->local_count && i < MAX_INTERFACES; i++) {
-        fprintf(stderr, "[MAC]   fwd[%d]=%s live=%d\n",
-                i,
-                fwd->locals[i].ifname[0] ? fwd->locals[i].ifname : "-",
-                ne_pair_local_live(&fwd->pair, i));
-    }
-    for (int i = 0; i < cfg_n && i < MAX_INTERFACES; i++) {
-        fprintf(stderr, "[MAC]   cfg[%d]=%s\n",
-                i, fwd->cfg->locals[i].ifname[0] ? fwd->cfg->locals[i].ifname : "-");
-    }
-}
-
 static void table_maintain(struct forwarder *fwd)
 {
-    uint8_t purged_mac[MAC_LEN];
-    char purged_ifname[IF_NAMESIZE];
-    int purge_count = 0;
-
     if (!fwd)
         return;
-    log_index_space_mismatch(fwd);
     pthread_spin_lock(&fwd->mac_table.lock);
-    table_purge_orphan_locked(&fwd->mac_table, fwd, purged_mac, purged_ifname, &purge_count);
-    if (purge_count > 0)
-        log_mac_runtime_table_from_locked(fwd, "purge");
+    table_purge_orphan_locked(&fwd->mac_table, fwd, NULL, NULL, NULL);
     /* RAM-only purge — keep orphan MAC lines on disk for later restore. */
     pthread_spin_unlock(&fwd->mac_table.lock);
-
-    if (purge_count > 0) {
-        uint64_t now_ms = monotonic_ms();
-
-        if (now_ms - g_last_purge_log_ms >= MAC_PURGE_LOG_INTERVAL_MS) {
-            g_last_purge_log_ms = now_ms;
-            fprintf(stderr, "[MAC] purge summary count=%d (first iface=%s)\n",
-                    purge_count, purged_ifname[0] ? purged_ifname : "-");
-        }
-    }
 }
 
 int mac_fwd_local_for_cfg_idx(const struct forwarder *fwd, int cfg_li)
@@ -1129,39 +829,17 @@ void mac_learn_persist(struct forwarder *fwd)
 void mac_learn_restore(struct forwarder *fwd)
 {
     int loaded;
-    int skip_ifname = 0;
-    int skip_other = 0;
 
     if (!fwd)
         return;
     mac_learn_refresh_iface_macs(fwd);
     pthread_spin_lock(&fwd->mac_table.lock);
-    loaded = mac_fdb_persist_load_locked(&fwd->mac_table, fwd,
-                                         &skip_ifname, &skip_other);
+    loaded = mac_fdb_persist_load_locked(&fwd->mac_table, fwd, NULL, NULL);
     purge_local_iface_macs_locked(&fwd->mac_table);
     enforce_one_mac_per_ifname_locked(&fwd->mac_table);
-    if (loaded > 0) {
-        char ev[64];
-
-        snprintf(ev, sizeof(ev), "restore loaded=%d", loaded);
-        log_mac_runtime_table_from_locked(fwd, ev);
-        mac_fdb_persist_save_locked(&fwd->mac_table, fwd);
-    }
-    pthread_spin_unlock(&fwd->mac_table.lock);
-
     if (loaded > 0)
-        fprintf(stderr,
-                "[MAC-FDB] restored %d (skipped ifname=%d other=%d) from %s\n",
-                loaded, skip_ifname, skip_other, MAC_LAN_LOG_PATH);
-    else if (skip_ifname > 0 || skip_other > 0)
-        fprintf(stderr,
-                "[MAC-FDB] restored 0 (skipped ifname=%d other=%d) from %s "
-                "(wait LAN ARP learn)\n",
-                skip_ifname, skip_other, MAC_LAN_LOG_PATH);
-    else
-        fprintf(stderr, "[MAC-FDB] no cache at %s (wait LAN ARP learn)\n",
-                MAC_LAN_LOG_PATH);
-    fflush(stderr);
+        mac_fdb_persist_save_locked(&fwd->mac_table, fwd);
+    pthread_spin_unlock(&fwd->mac_table.lock);
 }
 
 void mac_learn_tick(struct forwarder *fwd)

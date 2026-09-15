@@ -12,7 +12,6 @@
 #include "../../../inc/core/iface/profile_iface_xdp.h"
 #include "../../../inc/core/flow/mac_learn.h"
 #include "../../../inc/core/flow/flow_table.h"
-#include "../../../inc/core/dataplane/dataplane_stats.h"
 #include "../../../inc/core/dataplane/dp_idle.h"
 #include "../../../inc/crypto/pqc_handshake.h"
 
@@ -21,7 +20,6 @@
 #include <sched.h>
 #include <stdatomic.h>
 #include <string.h>
-#include <stdio.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -38,7 +36,6 @@ static void dp_maint_tick(struct forwarder *fwd)
     fwd_wan_drain_tick(fwd);
     fwd_wan_weight_blend_tick();
     mac_learn_tick(fwd);
-    ne_dp_stats_tick(fwd);
 }
 static void pin_cpu(unsigned int cpu)
 {
@@ -48,11 +45,9 @@ static void pin_cpu(unsigned int cpu)
     CPU_ZERO(&cpuset);
     CPU_SET(cpu, &cpuset);
     rc = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
-    if (rc != 0) {
-        fprintf(stderr, "[DP-CONF] cannot pin thread to CPU%u: %s\n",
-                cpu, strerror(rc));
-        fflush(stderr);
-    }
+    if (rc != 0)
+        main_diag_log(MAIN_DIAG_ERROR, "DP-CONF",
+                      "cannot pin thread to CPU%u: %s", cpu, strerror(rc));
 }
 
 static int dataplane_uses_cpu(int cpu)
@@ -74,7 +69,6 @@ static int dataplane_uses_cpu(int cpu)
 
 void forwarder_pin_cpu(void)
 {
-    static atomic_int logged;
     cpu_set_t allowed;
 
     CPU_ZERO(&allowed);
@@ -84,14 +78,8 @@ void forwarder_pin_cpu(void)
         if (!CPU_ISSET(cpu, &allowed) || dataplane_uses_cpu(cpu))
             continue;
         pin_cpu((unsigned int)cpu);
-        if (!atomic_exchange_explicit(&logged, 1, memory_order_relaxed))
-            fprintf(stderr, "[DP-CONF] control/DB threads pinned to spare CPU%d\n", cpu);
         return;
     }
-
-    /* Never force control/DB work onto RX_LAN CPU0 when every CPU is reserved. */
-    if (!atomic_exchange_explicit(&logged, 1, memory_order_relaxed))
-        fprintf(stderr, "[DP-CONF] no spare housekeeping CPU; control threads left unpinned\n");
 }
 
 void forwarder_runtime_lock(void)
@@ -179,8 +167,6 @@ static int dp_burst_tx_local(struct forwarder *fwd, int local_idx, int tx_slot)
     if (!ne_pair_local_live(&fwd->pair, local_idx))
         return 0;
 
-    ne_dp_tx_ctx("LAN", tx_slot);
-
     nring = tx_collect_worker_rings(rings, fwd->mid_to_local[local_idx], tx_slot,
                                     (int)NE_TX_SLOTS);
     if (nring <= 0)
@@ -202,8 +188,6 @@ static int dp_tx_wan_once(struct forwarder *fwd, int wan_idx, int tx_slot)
 
     if (!ne_pair_wan_live(&fwd->pair, wan_idx))
         return 0;
-
-    ne_dp_tx_ctx("WAN", tx_slot);
 
     nring = tx_collect_worker_rings(rings, fwd->mid_to_wan[wan_idx], tx_slot,
                                     (int)NE_TX_SLOTS);
@@ -280,7 +264,6 @@ static void *local_rx_thread(void *arg)
             int fds[NE_DP_POLLFD_MAX];
             int nfds;
 
-            ne_dp_warn_rx("LAN", (int)ctx->cpu_id, 0);
             ne_kick_fq_local_slot(&fwd->pair, ctx->rx_slot);
             if (ne_dp_idle_arm(&idle, -1)) {
                 nfds = ne_rx_local_fds(&fwd->pair, ctx->rx_slot, fds, NE_DP_POLLFD_MAX);
@@ -289,13 +272,6 @@ static void *local_rx_thread(void *arg)
             continue;
         }
         ne_dp_idle_note_work(&idle);
-
-        {
-            uint64_t rx_bytes = 0;
-            for (int i = 0; i < rcvd; i++)
-                rx_bytes += batch[i].len;
-            ne_dp_stats_rx_lan(ctx->rx_slot, (uint32_t)rcvd, rx_bytes);
-        }
 
         for (int i = 0; i < rcvd; i++) {
             const uint8_t *pkt = ne_packet_data(&fwd->pair, batch[i].addr);
@@ -307,10 +283,6 @@ static void *local_rx_thread(void *arg)
 
                 batch[i].tx_slot = (uint8_t)tx_slot;
                 if (ne_ring_try_push(&fwd->local_to_mid[wi], &batch[i]) != 0) {
-                    ne_dp_warn_rx_drop("LAN", (int)ctx->cpu_id, wi,
-                                       ne_ring_count(&fwd->local_to_mid[wi]));
-                    ne_dp_stats_rx_ring_drop_lan(ctx->rx_slot, 1);
-                    ne_dp_stats_crypto_ring_drop(wi, 1);
                     ne_frame_free(&fwd->pair, batch[i].addr);
                 } else {
                     ne_dp_idle_wake(NE_DP_WAKE_CRYPTO(wi));
@@ -401,7 +373,6 @@ static void *wan_rx_thread(void *arg)
             int fds[NE_DP_POLLFD_MAX];
             int nfds;
 
-            ne_dp_warn_rx("WAN", (int)ctx->cpu_id, 0);
             ne_kick_fq_wan_slot(&fwd->pair, ctx->rx_slot);
             if (ne_dp_idle_arm(&idle, -1)) {
                 nfds = ne_rx_wan_fds(&fwd->pair, ctx->rx_slot, fds, NE_DP_POLLFD_MAX);
@@ -410,13 +381,6 @@ static void *wan_rx_thread(void *arg)
             continue;
         }
         ne_dp_idle_note_work(&idle);
-
-        {
-            uint64_t rx_bytes = 0;
-            for (int i = 0; i < rcvd; i++)
-                rx_bytes += batch[i].len;
-            ne_dp_stats_rx_wan(ctx->rx_slot, (uint32_t)rcvd, rx_bytes);
-        }
 
         for (int i = 0; i < rcvd; i++) {
             int wi;
@@ -430,15 +394,10 @@ static void *wan_rx_thread(void *arg)
             if (dataplane_wan_needs_mid(fwd, pkt, batch[i].len)) {
                 wi = dp_crypto_pick_wan_worker(fwd, pkt, batch[i].len);
                 if (wi < 0 || wi >= (int)NE_CRYPTO_WORKERS) {
-                    ne_dp_stats_wan_drop(1);
                     ne_frame_free(&fwd->pair, batch[i].addr);
                     continue;
                 }
                 if (ne_ring_try_push(&fwd->wan_to_mid[wi], &batch[i]) != 0) {
-                    ne_dp_warn_rx_drop("WAN", (int)ctx->cpu_id, wi,
-                                       ne_ring_count(&fwd->wan_to_mid[wi]));
-                    ne_dp_stats_rx_ring_drop_wan(ctx->rx_slot, 1);
-                    ne_dp_stats_crypto_ring_drop(wi, 1);
                     ne_frame_free(&fwd->pair, batch[i].addr);
                 } else {
                     ne_dp_idle_wake(NE_DP_WAKE_CRYPTO(wi));
@@ -504,7 +463,6 @@ static void *crypto_worker_thread(void *arg)
         for (uint32_t i = 0; i < n; i++)
             dataplane_process_wan(fwd, jobs[i]);
         if (n) {
-            ne_dp_stats_crypto_wan(ctx->worker_idx, n);
             did_work = 1;
         }
         n = ne_ring_try_pop_batch(&fwd->local_to_mid[ctx->worker_idx], jobs,
@@ -514,7 +472,6 @@ static void *crypto_worker_thread(void *arg)
             dataplane_process_local(fwd, jobs[i]);
         }
         if (n) {
-            ne_dp_stats_crypto_lan(ctx->worker_idx, n);
             did_work = 1;
         }
         if (crypto_on && ++gc_tick >= 2048) {
@@ -540,11 +497,9 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
         return -1;
     if (forwarder_should_stop())
         return -1;
-    if (config_count_dataplane_wans(cfg) <= 0) {
-        fprintf(stderr,
-                "[FWD] no dataplane WAN — LAN-only until a dataplane WAN is added\n");
-        fflush(stderr);
-    }
+    if (config_count_dataplane_wans(cfg) <= 0)
+        main_diag_log(MAIN_DIAG_WARN, "FWD",
+                      "no dataplane WAN; running LAN-only");
 
     memset(fwd, 0, sizeof(*fwd));
     dataplane_udp_reorder_configure();
@@ -557,8 +512,6 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
         fwd->wan_count = MAX_INTERFACES;
 
     crypto_option_set_mtu(resolve_runtime_frag_mtu(cfg));
-    fprintf(stderr, "[FRAG] runtime MTU set to %u\n", crypto_option_get_mtu());
-    ne_dp_stats_init();
     ne_dp_idle_init();
 
     for (int i = 0; i < fwd->local_count; i++)
@@ -627,8 +580,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
     mac_learn_restore(fwd);
     // MAC_LEARN
     if (wan_failover_start(fwd) != 0) {
-        fprintf(stderr, "[FWD] wan_failover_start failed\n");
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_ERROR, "FWD", "WAN failover start failed");
     }
     atomic_store_explicit(&running, 1, memory_order_release);
     return 0;
@@ -692,8 +644,6 @@ void forwarder_run(struct forwarder *fwd)
 
     active_tx_slots = forwarder_active_tx_slots(fwd);
     dp_route_set_active_tx_slots((uint32_t)active_tx_slots);
-    fprintf(stderr, "[DP-CONF] active TX slots=%d (configured=%u, limited by XSK queues)\n",
-            active_tx_slots, (unsigned)NE_TX_SLOTS);
 
     {
         int lan_rx_active = ne_rx_lan_slots_for(fwd->pair.local_queue_total);
@@ -750,7 +700,6 @@ void forwarder_run(struct forwarder *fwd)
 
     fwd->threads_started = 1;
     if (fwd->cfg) {
-        ne_cpu_map_log();
         fwd_crypto_sync_pqc_session_keys(fwd->cfg);
         main_diag_log_dataplane_ready(fwd);
     }

@@ -8,7 +8,6 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/select.h>
-#include <time.h>
 #include <unistd.h>
 #include <pthread.h>
 #include "vault.h"
@@ -31,21 +30,11 @@
 #define WAN_ADMIN_CHANNEL "xdp_wan_admin"
 
 static volatile sig_atomic_t g_stop_requested = 0;
-static volatile sig_atomic_t g_stop_logged = 0;
-static volatile sig_atomic_t g_stop_signal_count = 0;
 
 static void on_stop_signal(int sig) {
     (void)sig;
-    g_stop_signal_count++;
     g_stop_requested = 1;
     forwarder_stop();
-    if (!g_stop_logged) {
-        g_stop_logged = 1;
-        fprintf(stderr, "\n[STOP] shutting down (Ctrl+C / SIGTERM)\n");
-    }
-    if (g_stop_signal_count >= 2) {
-        fprintf(stderr, "[STOP] shutdown in progress (do not spam Ctrl+C)\n");
-    }
 }
 
 static int parse_notify_profile_id(const char *payload) {
@@ -119,15 +108,18 @@ static int parse_startup_profile_id(int argc, char **argv, int *out_id) {
 
         if (strcmp(arg, "-id") == 0) {
             if (*out_id >= 0) {
-                fprintf(stderr, "[FATAL] -id specified more than once\n");
+                main_diag_log(MAIN_DIAG_ERROR, "CLI",
+                              "-id specified more than once");
                 return -1;
             }
             if (i + 1 >= argc) {
-                fprintf(stderr, "[FATAL] -id requires ne_profiles.id\n");
+                main_diag_log(MAIN_DIAG_ERROR, "CLI",
+                              "-id requires a profile id");
                 return -1;
             }
             if (parse_profile_id_token(argv[++i], out_id) != 0) {
-                fprintf(stderr, "[FATAL] invalid ne_profiles.id: %s\n", argv[i]);
+                main_diag_log(MAIN_DIAG_ERROR, "CLI",
+                              "invalid profile id: %s", argv[i]);
                 return -1;
             }
             continue;
@@ -135,18 +127,20 @@ static int parse_startup_profile_id(int argc, char **argv, int *out_id) {
 
         if (strncmp(arg, "-id=", 4) == 0) {
             if (*out_id >= 0) {
-                fprintf(stderr, "[FATAL] -id specified more than once\n");
+                main_diag_log(MAIN_DIAG_ERROR, "CLI",
+                              "-id specified more than once");
                 return -1;
             }
             const char *id_str = arg + 4;
             if (parse_profile_id_token(id_str, out_id) != 0) {
-                fprintf(stderr, "[FATAL] invalid ne_profiles.id: %s\n", id_str);
+                main_diag_log(MAIN_DIAG_ERROR, "CLI",
+                              "invalid profile id: %s", id_str);
                 return -1;
             }
             continue;
         }
 
-        fprintf(stderr, "[FATAL] unknown option: %s\n", arg);
+        main_diag_log(MAIN_DIAG_ERROR, "CLI", "unknown option: %s", arg);
         return -1;
     }
     return 0;
@@ -170,7 +164,7 @@ static int notify_profile_load(int profile_id)
 
     PGconn *conn = PQconnectdbParams(pg.keywords, pg.values, 0);
     if (PQstatus(conn) != CONNECTION_OK) {
-        fprintf(stderr, "[ERR] DB: %s", PQerrorMessage(conn));
+        main_diag_log(MAIN_DIAG_ERROR, "DB", "%s", PQerrorMessage(conn));
         PQfinish(conn);
         return -1;
     }
@@ -179,7 +173,8 @@ static int notify_profile_load(int profile_id)
     snprintf(sql, sizeof(sql), "SELECT pg_notify('%s', 'load:%d')", NOTIFY_CHANNEL, profile_id);
     PGresult *res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        fprintf(stderr, "[ERR] pg_notify failed: %s", PQerrorMessage(conn));
+        main_diag_log(MAIN_DIAG_ERROR, "DB", "profile notify failed: %s",
+                      PQerrorMessage(conn));
         PQclear(res);
         PQfinish(conn);
         return -1;
@@ -198,7 +193,7 @@ static int notify_wan_admin(const char *op, const char *ifname)
     PGresult *res;
 
     if (!op || !ifname || !ifname[0] || strlen(ifname) >= IF_NAMESIZE) {
-        fprintf(stderr, "[ERR] invalid WAN ifname\n");
+        main_diag_log(MAIN_DIAG_ERROR, "CLI", "invalid WAN interface name");
         return -1;
     }
     if (ne_postgres_conn_fill(&pg) != 0)
@@ -206,7 +201,7 @@ static int notify_wan_admin(const char *op, const char *ifname)
 
     conn = PQconnectdbParams(pg.keywords, pg.values, 0);
     if (PQstatus(conn) != CONNECTION_OK) {
-        fprintf(stderr, "[ERR] DB: %s", PQerrorMessage(conn));
+        main_diag_log(MAIN_DIAG_ERROR, "DB", "%s", PQerrorMessage(conn));
         PQfinish(conn);
         return -1;
     }
@@ -215,16 +210,14 @@ static int notify_wan_admin(const char *op, const char *ifname)
     snprintf(sql, sizeof(sql), "SELECT pg_notify('%s', '%s')", WAN_ADMIN_CHANNEL, payload);
     res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        fprintf(stderr, "[ERR] pg_notify %s failed: %s", WAN_ADMIN_CHANNEL, PQerrorMessage(conn));
+        main_diag_log(MAIN_DIAG_ERROR, "DB", "WAN notify failed: %s",
+                      PQerrorMessage(conn));
         PQclear(res);
         PQfinish(conn);
         return -1;
     }
     PQclear(res);
     PQfinish(conn);
-    fprintf(stderr,
-            "[NOTIFY] sent %s to channel %s (daemon applies on mid-core)\n",
-            payload, WAN_ADMIN_CHANNEL);
     return 0;
 }
 
@@ -236,32 +229,24 @@ static int handle_wan_admin_notify(struct runtime_state *rt, const char *payload
     if (!rt || !payload || !payload[0])
         return -1;
     if (!rt->has_thread || !rt->running) {
-        fprintf(stderr, "[WAN-ADMIN] ignore %s — dataplane not running (load a profile first)\n",
-                payload);
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_WARN, "WAN-ADMIN",
+                      "ignored request while dataplane is stopped");
         return -1;
     }
 
     if (strncmp(payload, "di:", 3) == 0) {
         ifname = payload + 3;
-        fprintf(stderr, "\n[WAN-ADMIN] notify KICK %s\n", ifname);
-        fflush(stderr);
         rc = wan_admin_kick(&rt->fwd, ifname);
-        if (rc != 0)
-            fprintf(stderr, "[WAN-ADMIN] KICK failed for %s\n", ifname);
         return rc;
     }
     if (strncmp(payload, "ai:", 3) == 0) {
         ifname = payload + 3;
-        fprintf(stderr, "\n[WAN-ADMIN] notify RESTORE %s\n", ifname);
-        fflush(stderr);
         rc = wan_admin_restore(&rt->fwd, ifname);
-        if (rc != 0)
-            fprintf(stderr, "[WAN-ADMIN] RESTORE failed for %s\n", ifname);
         return rc;
     }
 
-    fprintf(stderr, "[WARN] ignoring WAN_ADMIN payload: \"%s\"\n", payload);
+    main_diag_log(MAIN_DIAG_WARN, "WAN-ADMIN",
+                  "invalid request payload");
     return -1;
 }
 
@@ -270,17 +255,12 @@ static void *forwarder_thread_main(void *arg) {
     struct runtime_state *rt = (struct runtime_state *)arg;
     if (forwarder_init(&rt->fwd, &rt->cfg_slots[rt->active_slot]) != 0) {
         forwarder_cleanup(&rt->fwd);
-        if (forwarder_should_stop()) {
-            fprintf(stderr, "[STOP] forwarder init aborted\n");
-        } 
-        else {
-            fprintf(stderr, "[FATAL] forwarder_init failed\n");
-        }
+        if (!forwarder_should_stop())
+            main_diag_log(MAIN_DIAG_FATAL, "FWD", "initialization failed");
         rt->running = 0;
         return NULL;
     }
     if (forwarder_should_stop()) {
-        fprintf(stderr, "[STOP] forwarder init aborted\n");
         forwarder_cleanup(&rt->fwd);
         rt->running = 0;
         return NULL;
@@ -303,7 +283,8 @@ static int runtime_start(struct runtime_state *rt, const struct app_config *cfg)
 
     forwarder_clear_stop();
     if (pthread_create(&rt->thread, NULL, forwarder_thread_main, rt) != 0) {
-        fprintf(stderr, "[FATAL] failed to create forwarder thread\n");
+        main_diag_log(MAIN_DIAG_FATAL, "FWD",
+                      "cannot create forwarder thread");
         return -1;
     }
     rt->has_thread = 1;
@@ -342,16 +323,6 @@ static const struct crypto_policy *policy_by_db_id(const struct app_config *cfg,
             return &cfg->policies[i];
     }
     return NULL;
-}
-
-static void log_policy_db_ids(const char *tag, const struct app_config *cfg)
-{
-    if (!cfg)
-        return;
-    fprintf(stderr, "%s policy db_ids(%d):", tag, cfg->policy_count);
-    for (int i = 0; i < cfg->policy_count; i++)
-        fprintf(stderr, " %d", cfg->policies[i].db_id);
-    fprintf(stderr, "\n");
 }
 
 static int policies_db_unchanged(const struct app_config *old,
@@ -508,15 +479,6 @@ static int config_db_unchanged(const struct app_config *old,
     return profile_db_unchanged(&old->profiles[0], &new->profiles[0], old, new);
 }
 
-static int profiles_fully_unchanged(const struct app_config *old,
-                                    const struct app_config *new)
-{
-    if (!old || !new || old->profile_count < 1 || new->profile_count < 1)
-        return 0;
-    return profile_db_unchanged(&old->profiles[0], &new->profiles[0], old, new);
-}
-
-
 static int lan_wan_db_unchanged(const struct app_config *old,
                                 const struct app_config *new)
 {
@@ -540,35 +502,21 @@ static int lan_wan_db_unchanged(const struct app_config *old,
     return 1;
 }
 
-
-static int runtime_tuning_only_change(const struct app_config *old,
-                                      const struct app_config *new)
-{
-    if (!old || !new || lan_wan_db_unchanged(old, new))
-        return 0;
-    if (!forwarder_same_topology(old, new))
-        return 0;
-    if (!policies_db_unchanged(old, new))
-        return 0;
-    return profiles_fully_unchanged(old, new);
-}
-
 static int apply_active_configs(struct runtime_state *rt, int profile_id) {
     struct app_config *new_cfg = calloc(1, sizeof(*new_cfg));
     if (!new_cfg) {
-        fprintf(stderr, "[FATAL] out of memory building config\n");
+        main_diag_log(MAIN_DIAG_FATAL, "CONFIG",
+                      "out of memory building configuration");
         return -1;
     }
     if (load_profile_config(new_cfg, profile_id) != 0) {
-        fprintf(stderr,
-                "[ERR] profile %d: failed to load config from Postgres (see [DB] lines above)\n",
-                profile_id);
+        main_diag_log(MAIN_DIAG_ERROR, "CONFIG",
+                      "failed to load profile %d", profile_id);
         free(new_cfg);
         return -1;
     }
 
     if (!rt->has_thread) {
-        fprintf(stderr, "[LOAD] active: %d\n", profile_id);
         main_diag_log_db_apply(new_cfg, profile_id, NULL);
         int rc = runtime_start(rt, new_cfg);
         free(new_cfg);
@@ -582,23 +530,15 @@ static int apply_active_configs(struct runtime_state *rt, int profile_id) {
     free(new_cfg);
 
     if (config_db_unchanged(prev_cfg, &rt->cfg_slots[next_slot])) {
-        fprintf(stderr,
-                "[DB] profile %d — no change on first read (Postgres may not have committed yet), retry...\n",
-                profile_id);
-        fflush(stderr);
         usleep(500000);
         if (load_profile_config(&rt->cfg_slots[next_slot], profile_id) != 0) {
-            fprintf(stderr,
-                    "[ERR] profile %d: DB reload retry failed (see [DB] lines above)\n",
-                    profile_id);
+            main_diag_log(MAIN_DIAG_ERROR, "CONFIG",
+                          "reload retry failed for profile %d", profile_id);
             return -1;
         }
     }
 
     if (config_db_unchanged(prev_cfg, &rt->cfg_slots[next_slot])) {
-        log_policy_db_ids("[DB] Postgres", &rt->cfg_slots[next_slot]);
-        log_policy_db_ids("[DB] running", prev_cfg);
-        main_diag_log_no_update(profile_id, prev_cfg);
         return 0;
     }
 
@@ -611,11 +551,9 @@ static int apply_active_configs(struct runtime_state *rt, int profile_id) {
         main_diag_log_db_apply(&rt->cfg_slots[next_slot], profile_id, prev_cfg);
 
     if (!topo_ok) {
-        fprintf(stderr,
-                "[RELOAD] profile %d — LAN/WAN change — full dataplane restart "
-                "(clean UMEM; service stays up)\n",
-                profile_id);
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_INFO, "RELOAD",
+                      "profile %d topology changed; restarting dataplane",
+                      profile_id);
         if (runtime_stop_forwarder(rt) != 0)
             return -1;
         if (g_stop_requested)
@@ -623,93 +561,45 @@ static int apply_active_configs(struct runtime_state *rt, int profile_id) {
         rt->active_slot = next_slot;
         if (runtime_start(rt, &rt->cfg_slots[rt->active_slot]) != 0)
             return -1;
-        fprintf(stderr,
-                "[RELOAD] OK profile %d — applied (full dataplane restart)\n",
-                profile_id);
         main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], profile_id, 1, 0);
-        fflush(stderr);
         return 0;
     }
 
     if (!policy_only) {
-
-        int tuning = runtime_tuning_only_change(prev_cfg, &rt->cfg_slots[next_slot]);
-        fprintf(stderr,
-                "[RELOAD] profile %d — same LAN/WAN ifnames (%s, hot reload)\n",
-                profile_id, tuning ? "tuning" : "settings/profile fields");
-        fflush(stderr);
         if (forwarder_reload_config(&rt->fwd, &rt->cfg_slots[next_slot]) == 0) {
             rt->active_slot = next_slot;
-            fprintf(stderr,
-                    "[RELOAD] OK profile %d — applied (same-topology hot reload)\n",
-                    profile_id);
             main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot],
                                          profile_id, 1, 0);
-            fflush(stderr);
             return 0;
         }
-        fprintf(stderr,
-                "[ERR] profile %d: same-topology hot reload failed — "
-                "running dataplane unchanged (no full restart)\n",
-                profile_id);
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_ERROR, "RELOAD",
+                      "profile %d hot reload failed; dataplane unchanged",
+                      profile_id);
         return -1;
     }
 
-    fprintf(stderr,
-            "[RELOAD] profile %d — policies/crypto only (LAN/WAN ifaces unchanged)\n",
-            profile_id);
-    fflush(stderr);
-
     if (forwarder_reload_config(&rt->fwd, &rt->cfg_slots[next_slot]) == 0) {
         rt->active_slot = next_slot;
-        fprintf(stderr, "[RELOAD] OK profile %d — applied (hot reload)\n", profile_id);
-        fprintf(stderr, "[RELOAD] active: %d\n", profile_id);
         main_diag_log_config_summary(&rt->cfg_slots[rt->active_slot], profile_id, 1, 1);
-        fflush(stderr);
         return 0;
     }
-    fprintf(stderr,
-            "[ERR] profile %d: policy hot reload failed — "
-            "running dataplane unchanged (no full restart)\n",
-            profile_id);
-    fflush(stderr);
+    main_diag_log(MAIN_DIAG_ERROR, "RELOAD",
+                  "profile %d policy reload failed; dataplane unchanged",
+                  profile_id);
     return -1;
-}
-
-static void stop_log_step(const char *step)
-{
-    struct timespec ts;
-
-    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
-        fprintf(stderr, "[STOP] %s\n", step);
-        fflush(stderr);
-        return;
-    }
-    fprintf(stderr, "[STOP] %ld.%03ld %s\n",
-            (long)ts.tv_sec, ts.tv_nsec / 1000000L, step);
-    fflush(stderr);
 }
 
 static int runtime_stop_forwarder(struct runtime_state *rt) {
     if (!rt->has_thread)
         return 0;
 
-    fprintf(stderr, "[STOP] stopping dataplane...\n");
-    fflush(stderr);
-    stop_log_step("forwarder_stop");
     forwarder_stop();
     forwarder_shutdown_resources();
-    stop_log_step("pthread_join forwarder");
     pthread_join(rt->thread, NULL);
-    stop_log_step("forwarder_cleanup begin");
     forwarder_cleanup(&rt->fwd);
-    stop_log_step("forwarder_cleanup done");
 
-    stop_log_step("promisc off");
     interface_promisc_off_config(&rt->cfg_slots[rt->active_slot]);
 
-    stop_log_step("done (dataplane stopped; xdp/id cleared until -id)");
     rt->has_thread = 0;
     rt->running = 0;
     return 0;
@@ -726,16 +616,6 @@ static int load_profile_and_run(struct runtime_state *rt,
     return 0;
 }
 
-static const char *g_prog_name = "network-encryptor";
-
-static void daemon_idle_log(void)
-{
-    fprintf(stderr,
-            "[DAEMON] listening %s + %s — use %s -id <id> | -di <wan> | -ai <wan> | -gs <name>\n",
-            NOTIFY_CHANNEL, WAN_ADMIN_CHANNEL, g_prog_name);
-    fflush(stderr);
-}
-
 static void return_to_blank_daemon(struct runtime_state *rt,
                                    int *active_profile_id)
 {
@@ -749,12 +629,8 @@ static void return_to_blank_daemon(struct runtime_state *rt,
     sig_pqc_prepare_reload();
     sig_pqc_finalize_reload();
     forwarder_clear_stop();
-    main_diag_ne_pqc_clear_all();
-
     if (rt)
         memset(rt, 0, sizeof(*rt));
-
-    daemon_idle_log();
 }
 
 static int handle_profile_notify(struct runtime_state *rt,
@@ -764,37 +640,23 @@ static int handle_profile_notify(struct runtime_state *rt,
         return 0;
 
     if (ne_profile_id_exists(profile_id) != 0) {
-        fprintf(stderr,
-                "[FAIL] profile id=%d not found in DB — load aborted\n",
-                profile_id);
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_ERROR, "LOAD",
+                      "profile %d not found; load aborted", profile_id);
         return_to_blank_daemon(rt, active_profile_id);
         return 0;
     }
 
     if (rt->has_thread && *active_profile_id <= 0) {
-        fprintf(stderr,
-                "[LOAD] stale dataplane (thread without active profile) — reset to idle\n");
-        fflush(stderr);
         return_to_blank_daemon(rt, active_profile_id);
     } else if (rt->has_thread && !rt->running) {
-        fprintf(stderr,
-                "[LOAD] dataplane thread not running — reset to idle before load\n");
-        fflush(stderr);
         return_to_blank_daemon(rt, active_profile_id);
     } else if (*active_profile_id > 0 && *active_profile_id != profile_id) {
-        fprintf(stderr,
-                "[LOAD] replace profile %d → %d (clear old, then load)\n",
-                *active_profile_id, profile_id);
-        fflush(stderr);
         return_to_blank_daemon(rt, active_profile_id);
     }
 
     if (load_profile_and_run(rt, active_profile_id, profile_id) != 0) {
-        fprintf(stderr,
-                "[FAIL] load profile id=%d failed — load aborted\n",
-                profile_id);
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_ERROR, "LOAD",
+                      "profile %d load failed", profile_id);
         return_to_blank_daemon(rt, active_profile_id);
         return -1;
     }
@@ -802,8 +664,6 @@ static int handle_profile_notify(struct runtime_state *rt,
 }
 
 int main(int argc, char **argv) {
-    g_prog_name = argv[0] ? argv[0] : "network-encryptor";
-
     int ipc_rc = sig_pqc_handle_ipc_cli(argc, argv);
     if (ipc_rc >= 0) {
         return ipc_rc;
@@ -817,26 +677,23 @@ int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "-gs") == 0)
         return cfm_status_ipc_query(argv[2]);
     if (argc == 2 && strcmp(argv[1], "-gs") == 0) {
-        fprintf(stderr, "[ERR] -gs requires <wan_if|bridge>\n");
+        main_diag_log(MAIN_DIAG_ERROR, "CLI",
+                      "-gs requires <wan_if|bridge>");
         return 1;
     }
 
     if (argc == 3 && strcmp(argv[1], "-di") == 0) {
         if (load_ne_env() != 0) {
-            fprintf(stderr,
-                    "[FATAL] Vault/DB bootstrap failed "
-                    "(check " NE_ENV_FILE " VAULT_* / UNSEAL_KEY_* and Vault "
-                    NE_VAULT_SECRET_PATH ")\n");
+            main_diag_log(MAIN_DIAG_FATAL, "BOOT",
+                          "Vault/DB bootstrap failed");
             return 1;
         }
         return notify_wan_admin("di", argv[2]) != 0 ? 1 : 0;
     }
     if (argc == 3 && strcmp(argv[1], "-ai") == 0) {
         if (load_ne_env() != 0) {
-            fprintf(stderr,
-                    "[FATAL] Vault/DB bootstrap failed "
-                    "(check " NE_ENV_FILE " VAULT_* / UNSEAL_KEY_* and Vault "
-                    NE_VAULT_SECRET_PATH ")\n");
+            main_diag_log(MAIN_DIAG_FATAL, "BOOT",
+                          "Vault/DB bootstrap failed");
             return 1;
         }
         return notify_wan_admin("ai", argv[2]) != 0 ? 1 : 0;
@@ -844,7 +701,7 @@ int main(int argc, char **argv) {
 
     setbuf(stderr, NULL);
     if (trf_pqc_init_global() != TRF_PQC_OK) {
-        fprintf(stderr, "[FATAL] trf_pqc_init_global failed\n");
+        main_diag_log(MAIN_DIAG_FATAL, "PQC", "global initialization failed");
         return 1;
     }
 
@@ -865,20 +722,18 @@ int main(int argc, char **argv) {
 
     if (profile_id >= 0) {
         if (load_ne_env() != 0) {
-            fprintf(stderr,
-                    "[FATAL] Vault/DB bootstrap failed "
-                    "(check " NE_ENV_FILE " VAULT_* / UNSEAL_KEY_* and Vault "
-                    NE_VAULT_SECRET_PATH ")\n");
+            main_diag_log(MAIN_DIAG_FATAL, "BOOT",
+                          "Vault/DB bootstrap failed");
             return 1;
         }
         if (notify_profile_load(profile_id) != 0)
             return 1;
-        fprintf(stderr, "[NOTIFY] sent load:%d\n", profile_id);
         return 0;
     }
 
     if (argc > 1) {
-        fprintf(stderr, "[FATAL] unknown arguments (got %d)\n", argc - 1);
+        main_diag_log(MAIN_DIAG_ERROR, "CLI",
+                      "unknown arguments (got %d)", argc - 1);
         usage(argv[0]);
         return 1;
     }
@@ -891,18 +746,14 @@ int main(int argc, char **argv) {
     }
 
     if (load_ne_env() != 0) {
-        fprintf(stderr,
-                "[FATAL] Vault/DB bootstrap failed "
-                "(check " NE_ENV_FILE " VAULT_* / UNSEAL_KEY_* and Vault "
-                NE_VAULT_SECRET_PATH ")\n");
+        main_diag_log(MAIN_DIAG_FATAL, "BOOT", "Vault/DB bootstrap failed");
         return 1;
     }
 
     struct ne_postgres_conn pg;
     if (ne_postgres_conn_fill(&pg) != 0) {
-        fprintf(stderr,
-                "[FATAL] Vault " NE_VAULT_SECRET_PATH
-                " empty or incomplete — need POSTGRES_SERVER/PORT/USER/DB/PASSWORD\n");
+        main_diag_log(MAIN_DIAG_FATAL, "DB",
+                      "PostgreSQL connection configuration is incomplete");
         return 1;
     }
 
@@ -914,22 +765,18 @@ int main(int argc, char **argv) {
     forwarder_pin_cpu();
     PGconn *listen_conn = PQconnectdbParams(pg.keywords, pg.values, 0);
     if (PQstatus(listen_conn) != CONNECTION_OK) {
-        fprintf(stderr, "[FATAL] DB connection failed: %s", PQerrorMessage(listen_conn));
-        fprintf(stderr,
-                "[DB] tried host=%s port=%s dbname=%s user=%s (from Vault "
-                NE_VAULT_SECRET_PATH ")\n",
-                pg.values[0], pg.values[1], pg.values[2], pg.values[3]);
+        main_diag_log(MAIN_DIAG_FATAL, "DB", "connection failed: %s",
+                      PQerrorMessage(listen_conn));
         PQfinish(listen_conn);
         return 1;
     }
     PQclear(PQexec(listen_conn, "LISTEN " NOTIFY_CHANNEL));
     PQclear(PQexec(listen_conn, "LISTEN " WAN_ADMIN_CHANNEL));
 
-    daemon_idle_log();
-
     struct runtime_state *rt = calloc(1, sizeof(*rt));
     if (!rt) {
-        fprintf(stderr, "[FATAL] out of memory for runtime state\n");
+        main_diag_log(MAIN_DIAG_FATAL, "DAEMON",
+                      "out of memory for runtime state");
         PQfinish(listen_conn);
         return 1;
     }
@@ -976,12 +823,9 @@ int main(int argc, char **argv) {
             } else {
                 int id = -1;
                 if (parse_notify_profile_cmd(notify->extra, &id) != 0) {
-                    fprintf(stderr,
-                            "[WARN] ignoring NOTIFY with invalid payload: \"%s\"\n",
-                            notify->extra ? notify->extra : "");
+                    main_diag_log(MAIN_DIAG_WARN, "NOTIFY",
+                                  "ignored invalid profile payload");
                 } else {
-                    fprintf(stderr, "\n[NOTIFY] profile %d\n", id);
-                    fflush(stderr);
                     (void)handle_profile_notify(rt, &active_profile_id, id);
                 }
             }

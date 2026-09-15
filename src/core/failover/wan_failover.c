@@ -15,9 +15,6 @@ int wan_failover_start(struct forwarder *fwd)
     if (!wan_failover_enabled())
         return 0;
 
-    /* user=fwd: MAC table dump in cfm notify_is_up reads g_state_cb_user. */
-    cfm_set_state_callback(NULL, fwd);
-
     if (cfm_init(fwd->cfg) != 0)
         return -1;
     return 0;
@@ -30,7 +27,6 @@ void wan_failover_on_cfg(struct forwarder *fwd)
     if (!wan_failover_enabled())
         return;
 
-    cfm_set_state_callback(NULL, fwd);
     (void)cfm_init(fwd->cfg);
 }
 
@@ -38,7 +34,6 @@ void wan_failover_stop(void)
 {
     if (!wan_failover_enabled())
         return;
-    cfm_set_state_callback(NULL, NULL);
     cfm_cleanup();
 }
 

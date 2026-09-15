@@ -1,6 +1,7 @@
 #include "../../inc/db/db_config.h"
 #include "../../inc/crypto/eth_parse.h"
 #include "../../inc/db/db_env.h"
+#include "../../inc/core/util/main_diag.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,13 +77,13 @@ static int alloc_wire_policy_id(int db_row_id, uint8_t *used) {
         if (!used[(size_t)j]) {
             used[(size_t)j] = 1;
             if (db_row_id < 1 || db_row_id > 255)
-                fprintf(stderr,
-                        "[DB CRYPTO] policy db id=%d not in wire range 1..255; assigned wire id=%d\n",
-                        db_row_id, j);
+                main_diag_log(MAIN_DIAG_WARN, "DB-CRYPTO",
+                              "policy %d is outside wire range; assigned wire id %d",
+                              db_row_id, j);
             else
-                fprintf(stderr,
-                        "[DB CRYPTO] policy db id=%d: wire id %d already in use; assigned wire id=%d\n",
-                        db_row_id, db_row_id, j);
+                main_diag_log(MAIN_DIAG_WARN, "DB-CRYPTO",
+                              "policy %d wire id collision; assigned wire id %d",
+                              db_row_id, j);
             return j;
         }
     }
@@ -231,9 +232,9 @@ static void profile_append_locals_from_rows(struct app_config *cfg,
         if (li >= 0) {
             p->local_indices[p->local_count++] = li;
         } else {
-            fprintf(stderr,
-                    "[DB] profile \"%s\": ne_lan.interface=%s not in LAN list — row skipped\n",
-                    p->name, ifname);
+            main_diag_log(MAIN_DIAG_WARN, "DB",
+                          "profile %s skips LAN %s not present in LAN list",
+                          p->name, ifname);
         }
     }
 }
@@ -269,9 +270,9 @@ static void profile_append_wans_from_rows(struct app_config *cfg,
             p->wan_bandwidth_weight[p->wan_count] = weight;
             p->wan_count++;
         } else {
-            fprintf(stderr,
-                    "[DB] profile \"%s\": ne_wan.interface=%s not in WAN list — row skipped\n",
-                    p->name, ifname);
+            main_diag_log(MAIN_DIAG_WARN, "DB",
+                          "profile %s skips WAN %s not present in WAN list",
+                          p->name, ifname);
         }
     }
 }
@@ -289,9 +290,9 @@ static void profile_commit_bridge_pair(struct app_config *cfg, struct profile_co
 
     wan_dp = config_wan_cfg_to_dp(cfg, wan_cfg_idx);
     if (wan_dp < 0) {
-        fprintf(stderr,
-                "[DB] profile \"%s\": bridge WAN %s not on dataplane — skipped\n",
-                p->name, cfg->wans[wan_cfg_idx].ifname);
+        main_diag_log(MAIN_DIAG_WARN, "DB",
+                      "profile %s skips bridge WAN %s outside dataplane",
+                      p->name, cfg->wans[wan_cfg_idx].ifname);
         return;
     }
 
@@ -308,11 +309,6 @@ static void profile_commit_bridge_pair(struct app_config *cfg, struct profile_co
     else
         p->bridges[p->bridge_count].ifname[0] = '\0';
     p->bridge_count++;
-
-    fprintf(stderr, "[DB] bridge pair profile=%s br=%s LAN %s <-> WAN %s (dp=%d)\n",
-            p->name, bridge_name ? bridge_name : "?",
-            cfg->locals[local_idx].ifname,
-            cfg->wans[wan_cfg_idx].ifname, wan_dp);
 }
 
 static void profile_load_bridge_pairs_from_db(struct app_config *cfg,
@@ -344,8 +340,9 @@ static void profile_load_bridge_pairs_from_db(struct app_config *cfg,
         1, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        fprintf(stderr, "[DB] profile \"%s\": bridge pair query failed: %s\n",
-                p->name, PQresultErrorMessage(res));
+        main_diag_log(MAIN_DIAG_ERROR, "DB",
+                      "profile %s bridge query failed: %s",
+                      p->name, PQresultErrorMessage(res));
         PQclear(res);
         return;
     }
@@ -368,9 +365,10 @@ static void profile_load_bridge_pairs_from_db(struct app_config *cfg,
         int owned_wan = 0;
 
         if (li < 0 || wi < 0) {
-            fprintf(stderr,
-                    "[DB] profile \"%s\": bridge pair LAN %s WAN %s not in ne_lan/ne_wan — skipped\n",
-                    p->name, lan_if ? lan_if : "?", wan_if ? wan_if : "?");
+            main_diag_log(MAIN_DIAG_WARN, "DB",
+                          "profile %s skips invalid bridge pair LAN=%s WAN=%s",
+                          p->name, lan_if ? lan_if : "?",
+                          wan_if ? wan_if : "?");
             continue;
         }
 
@@ -383,19 +381,14 @@ static void profile_load_bridge_pairs_from_db(struct app_config *cfg,
                 owned_wan = 1;
         }
         if (!owned_lan || !owned_wan) {
-            fprintf(stderr,
-                    "[DB] profile \"%s\": bridge pair LAN %s WAN %s not owned by profile — skipped\n",
-                    p->name, lan_if, wan_if);
+            main_diag_log(MAIN_DIAG_WARN, "DB",
+                          "profile %s skips unowned bridge pair LAN=%s WAN=%s",
+                          p->name, lan_if, wan_if);
             continue;
         }
 
         profile_commit_bridge_pair(cfg, p, li, wi, br_name);
     }
-
-    if (p->bridge_count == 0)
-        fprintf(stderr,
-                "[DB] profile \"%s\": no bridge pairs in BE (profile_bridge_ref / bridge_interfaces)\n",
-                p->name);
 
     PQclear(res);
 }
@@ -410,7 +403,8 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         1, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
-        fprintf(stderr, "[DB] ne_profiles id=%d not found\n", profile_id);
+        main_diag_log(MAIN_DIAG_ERROR, "DB",
+                      "profile %d not found", profile_id);
         PQclear(res);
         return -1;
     }
@@ -420,7 +414,8 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
     int col_en = PQfnumber(res, "enabled");
     int col_bridge_en = PQfnumber(res, "bridge_enable");
     if (col_id < 0 || col_name < 0 || col_en < 0) {
-        fprintf(stderr, "[DB] ne_profiles row missing expected columns\n");
+        main_diag_log(MAIN_DIAG_ERROR, "DB",
+                      "profile query is missing required columns");
         PQclear(res);
         return -1;
     }
@@ -463,7 +458,8 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         1, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        fprintf(stderr, "[DB] ne_policies query failed: %s\n", PQresultErrorMessage(res));
+        main_diag_log(MAIN_DIAG_ERROR, "DB",
+                      "policy query failed: %s", PQresultErrorMessage(res));
         PQclear(res);
         return -1;
     }
@@ -482,8 +478,8 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         cp_base.priority = atoi(PQgetvalue(res, r, 1));
         cp_base.action = parse_action_name(PQgetvalue(res, r, 2));
         if (cp_base.action < 0) {
-            fprintf(stderr, "[DB CRYPTO] policy id=%d has unsupported action (only L2/bypass are allowed)\n",
-                    db_policy_id);
+            main_diag_log(MAIN_DIAG_ERROR, "DB-CRYPTO",
+                          "policy %d has unsupported action", db_policy_id);
             PQclear(res);
             return -1;
         }
@@ -505,8 +501,8 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
             sig_pqc_load_and_bind_policy(conn, cfg, cfg->profile_count - 1, db_policy_id, p->id);
             int wire_id = alloc_wire_policy_id(db_policy_id, wire_id_used);
             if (wire_id < 0) {
-                fprintf(stderr, "[DB CRYPTO] no free wire policy id for encrypt policy %d\n",
-                        db_policy_id);
+                main_diag_log(MAIN_DIAG_ERROR, "DB-CRYPTO",
+                              "no free wire id for policy %d", db_policy_id);
                 PQclear(res);
                 return -1;
             }
@@ -514,9 +510,9 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         }
 
         if (config_policy_db_id_taken(cfg, cp_base.db_id)) {
-            fprintf(stderr,
-                    "[VALIDATE] profile %d: duplicate policy db_id=%d\n",
-                    p->id, cp_base.db_id);
+            main_diag_log(MAIN_DIAG_ERROR, "VALIDATE",
+                          "profile %d has duplicate policy id %d",
+                          p->id, cp_base.db_id);
             PQclear(res);
             return -1;
         }
@@ -530,7 +526,8 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         int sp_n = ne_fill_nullable_list(sport_joined, PQgetisnull(res, r, 8), sp_items, MAX_CIDR_LIST_ITEMS);
         int dp_n = ne_fill_nullable_list(dport_joined, PQgetisnull(res, r, 9), dp_items, MAX_CIDR_LIST_ITEMS);
         if (src_n <= 0 || dst_n <= 0 || sp_n <= 0 || dp_n <= 0) {
-            fprintf(stderr, "[DB CRYPTO] policy id=%d has invalid match list\n", db_policy_id);
+            main_diag_log(MAIN_DIAG_ERROR, "DB-CRYPTO",
+                          "policy %d has invalid match list", db_policy_id);
             PQclear(res);
             return -1;
         }
@@ -540,7 +537,9 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
                 for (int spi = 0; spi < sp_n; spi++) {
                     for (int dpi = 0; dpi < dp_n; dpi++) {
                         if (cfg->policy_count >= MAX_CRYPTO_POLICIES || p->policy_count >= MAX_CRYPTO_POLICIES) {
-                            fprintf(stderr, "[DB CRYPTO] policy expansion overflow id=%d\n", db_policy_id);
+                            main_diag_log(MAIN_DIAG_ERROR, "DB-CRYPTO",
+                                          "policy %d expansion exceeds limit",
+                                          db_policy_id);
                             PQclear(res);
                             return -1;
                         }
@@ -586,10 +585,9 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
     }
     PQclear(res);
     if (p->enabled && p->policy_count <= 0) {
-        fprintf(stderr,
-                "[DB][CRYPTO-GUARD] profile %d (%s) active with policies=0; "
-                "IPv4 data path will fail-close until policy is added\n",
-                p->id, p->name);
+        main_diag_log(MAIN_DIAG_WARN, "CRYPTO-GUARD",
+                      "profile %d (%s) has no policies; data path is fail-closed",
+                      p->id, p->name);
     }
     sig_pqc_finalize_reload();
     return 0;
@@ -599,11 +597,12 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
 static int load_local_rows(struct app_config *cfg, PGresult *res) {
     int nrows = PQntuples(res);
     if (nrows == 0) {
-        fprintf(stderr, "[DB] No LAN (ne_lan) for this profile\n");
+        main_diag_log(MAIN_DIAG_ERROR, "DB", "profile has no LAN rows");
         return -1;
     }
     if (nrows > MAX_INTERFACES) {
-        fprintf(stderr, "[DB] Too many LAN rows (%d > %d)\n", nrows, MAX_INTERFACES);
+        main_diag_log(MAIN_DIAG_ERROR, "DB",
+                      "too many LAN rows (%d > %d)", nrows, MAX_INTERFACES);
         return -1;
     }
 
@@ -613,7 +612,8 @@ static int load_local_rows(struct app_config *cfg, PGresult *res) {
 
         const char *v = PQgetvalue(res, row, PQfnumber(res, "ifname"));
         if (!v || v[0] == '\0') {
-            fprintf(stderr, "[DB LOCAL][%d] ifname not specified\n", row);
+            main_diag_log(MAIN_DIAG_ERROR, "DB",
+                          "LAN row %d has no interface", row);
             return -1;
         }
         strncpy(loc->ifname, v, IF_NAMESIZE - 1);
@@ -626,11 +626,12 @@ static int load_local_rows(struct app_config *cfg, PGresult *res) {
 static int load_wan_rows(struct app_config *cfg, PGresult *res) {
     int nrows = PQntuples(res);
     if (nrows == 0) {
-        fprintf(stderr, "[DB] No WAN (ne_wan) for this profile\n");
+        main_diag_log(MAIN_DIAG_ERROR, "DB", "profile has no WAN rows");
         return -1;
     }
     if (nrows > MAX_INTERFACES) {
-        fprintf(stderr, "[DB] Too many WAN rows (%d > %d)\n", nrows, MAX_INTERFACES);
+        main_diag_log(MAIN_DIAG_ERROR, "DB",
+                      "too many WAN rows (%d > %d)", nrows, MAX_INTERFACES);
         return -1;
     }
 
@@ -640,7 +641,8 @@ static int load_wan_rows(struct app_config *cfg, PGresult *res) {
 
         const char *v = PQgetvalue(res, row, PQfnumber(res, "ifname"));
         if (!v || v[0] == '\0') {
-            fprintf(stderr, "[DB WAN][%d] ifname not specified\n", row);
+            main_diag_log(MAIN_DIAG_ERROR, "DB",
+                          "WAN row %d has no interface", row);
             return -1;
         }
         strncpy(wan->ifname, v, IF_NAMESIZE - 1);
@@ -670,12 +672,14 @@ static int db_verify_profile_id(PGconn *conn, int profile_id) {
         1, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        fprintf(stderr, "[DB] ne_profiles lookup failed: %s\n", PQresultErrorMessage(res));
+        main_diag_log(MAIN_DIAG_ERROR, "DB",
+                      "profile lookup failed: %s", PQresultErrorMessage(res));
         PQclear(res);
         return -1;
     }
     if (PQntuples(res) == 0) {
-        fprintf(stderr, "[DB] ne_profiles id=%d not found\n", profile_id);
+        main_diag_log(MAIN_DIAG_ERROR, "DB",
+                      "profile %d not found", profile_id);
         PQclear(res);
         return -1;
     }
@@ -694,7 +698,8 @@ static int db_load_lan_for_profile(PGconn *conn, struct app_config *cfg, int pro
         1, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        fprintf(stderr, "[DB] ne_lan query failed: %s\n", PQresultErrorMessage(res));
+        main_diag_log(MAIN_DIAG_ERROR, "DB",
+                      "LAN query failed: %s", PQresultErrorMessage(res));
         PQclear(res);
         return -1;
     }
@@ -718,7 +723,8 @@ static int db_load_wan_for_profile(PGconn *conn, struct app_config *cfg, int pro
         1, NULL, params, NULL, NULL, 0);
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        fprintf(stderr, "[DB] ne_wan query failed: %s\n", PQresultErrorMessage(res));
+        main_diag_log(MAIN_DIAG_ERROR, "DB",
+                      "WAN query failed: %s", PQresultErrorMessage(res));
         PQclear(res);
         return -1;
     }
@@ -737,10 +743,9 @@ int config_apply_crypto_from_policies(struct app_config *cfg) {
 
     if (cfg->policy_count <= 0) {
         if (cfg->profile_count > 0 && cfg->profiles[0].enabled) {
-            fprintf(stderr,
-                    "[CRYPTO-GUARD] profile %d (%s) has no policy; crypto_enabled=0 "
-                    "(data traffic requires policy match)\n",
-                    cfg->profiles[0].id, cfg->profiles[0].name);
+            main_diag_log(MAIN_DIAG_WARN, "CRYPTO-GUARD",
+                          "profile %d (%s) has no policy; crypto disabled",
+                          cfg->profiles[0].id, cfg->profiles[0].name);
         }
         return 0;
     }
@@ -777,7 +782,7 @@ int config_load_from_db(struct app_config *cfg, int profile_id, const char *conn
     (void)conn_str;
 
     if (!cfg) {
-        fprintf(stderr, "[DB] Null pointer argument (cfg)\n");
+        main_diag_log(MAIN_DIAG_ERROR, "DB", "null configuration target");
         return -1;
     }
 
@@ -791,7 +796,8 @@ int config_load_from_db(struct app_config *cfg, int profile_id, const char *conn
 
     PGconn *conn = PQconnectdbParams(pg.keywords, pg.values, 0);
     if (PQstatus(conn) != CONNECTION_OK) {
-        fprintf(stderr, "[DB] Connection failed: %s\n", PQerrorMessage(conn));
+        main_diag_log(MAIN_DIAG_ERROR, "DB", "connection failed: %s",
+                      PQerrorMessage(conn));
         PQfinish(conn);
         return -1;
     }

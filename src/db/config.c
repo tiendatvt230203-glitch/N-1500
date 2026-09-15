@@ -1,4 +1,5 @@
 #include "../../inc/core/util/config.h"
+#include "../../inc/core/util/main_diag.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -208,7 +209,8 @@ int config_validate(struct app_config *cfg) {
         struct local_config *local = &cfg->locals[i];
 
         if (local->ifname[0] == '\0') {
-            fprintf(stderr, "LOCAL[%d]: interface not specified\n", i);
+            main_diag_log(MAIN_DIAG_ERROR, "CONFIG",
+                          "LAN interface %d is not specified", i);
             return -1;
         }
     }
@@ -217,7 +219,8 @@ int config_validate(struct app_config *cfg) {
         struct wan_config *wan = &cfg->wans[i];
 
         if (wan->ifname[0] == '\0') {
-            fprintf(stderr, "WAN[%d]: interface not specified\n", i);
+            main_diag_log(MAIN_DIAG_ERROR, "CONFIG",
+                          "WAN interface %d is not specified", i);
             return -1;
         }
 
@@ -369,9 +372,6 @@ void config_refresh_policy_in_table(struct app_config *cfg)
             }
         }
         s_pol_in_n[0] = n;
-        fprintf(stderr,
-                "[CRYPTO-GUARD] profile %d (%s) WAN IN 5-tuple gate %s (%d compact rules)\n",
-                p->id, p->name, "ON (exact wire policy)", n);
     }
 }
 

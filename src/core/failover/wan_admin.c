@@ -3,9 +3,9 @@
 #include "../../../inc/core/forwarder/forwarder.h"
 #include "../../../inc/core/forwarder/forwarder_wan.h"
 #include "../../../inc/core/iface/interface.h"
+#include "../../../inc/core/util/main_diag.h"
 
 #include <net/if.h>
-#include <stdio.h>
 #include <string.h>
 
 static int find_cfg_wan_idx(const struct app_config *cfg, const char *ifname)
@@ -50,8 +50,8 @@ int wan_admin_kick(struct forwarder *fwd, const char *ifname)
     if (!fwd || !ifname || !ifname[0])
         return -1;
     if (!fwd->threads_started) {
-        fprintf(stderr, "[WAN-ADMIN] dataplane not running yet\n");
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_WARN, "WAN-ADMIN",
+                      "dataplane is not running");
         return -1;
     }
 
@@ -73,15 +73,13 @@ int wan_admin_kick(struct forwarder *fwd, const char *ifname)
     }
     if (di < 0) {
         forwarder_runtime_unlock();
-        fprintf(stderr, "[WAN-ADMIN] KICK %s — not found\n", ifname);
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_WARN, "WAN-ADMIN",
+                      "cannot disable %s: interface not found", ifname);
         return -1;
     }
 
     if (fwd_wan_admin_is_held(di)) {
         forwarder_runtime_unlock();
-        fprintf(stderr, "[WAN-ADMIN] KICK %s — already held\n", ifname);
-        fflush(stderr);
         return 0;
     }
 
@@ -89,9 +87,8 @@ int wan_admin_kick(struct forwarder *fwd, const char *ifname)
     fwd_wan_admin_hold_set(di, 1);
     forwarder_runtime_unlock();
 
-    fprintf(stderr, "[WAN-ADMIN] KICK OK %s dp=%d (traffic off, XDP/UMEM untouched)\n",
-            ifname, di);
-    fflush(stderr);
+    main_diag_log(MAIN_DIAG_INFO, "WAN-ADMIN",
+                  "%s disabled (dataplane slot %d)", ifname, di);
     return 0;
 }
 
@@ -104,15 +101,15 @@ int wan_admin_restore(struct forwarder *fwd, const char *ifname)
     if (!fwd || !fwd->cfg || !ifname || !ifname[0])
         return -1;
     if (!fwd->threads_started) {
-        fprintf(stderr, "[WAN-ADMIN] dataplane not running yet\n");
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_WARN, "WAN-ADMIN",
+                      "dataplane is not running");
         return -1;
     }
 
     ci = find_cfg_wan_idx(fwd->cfg, ifname);
     if (ci < 0 || !config_wan_live(fwd->cfg, ci)) {
-        fprintf(stderr, "[WAN-ADMIN] RESTORE %s — not dataplane in cfg\n", ifname);
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_WARN, "WAN-ADMIN",
+                      "cannot restore %s: not active in configuration", ifname);
         return -1;
     }
 
@@ -128,9 +125,8 @@ int wan_admin_restore(struct forwarder *fwd, const char *ifname)
     }
     if (di < 0 || !ne_pair_wan_live(&fwd->pair, di)) {
         forwarder_runtime_unlock();
-        fprintf(stderr, "[WAN-ADMIN] RESTORE %s — dp not plumbed (use -id reload)\n",
-                ifname);
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_WARN, "WAN-ADMIN",
+                      "cannot restore %s: dataplane is not plumbed", ifname);
         return -1;
     }
 
@@ -141,9 +137,7 @@ int wan_admin_restore(struct forwarder *fwd, const char *ifname)
     fwd_wan_join_ramp_begin(ci, target_w);
     forwarder_runtime_unlock();
 
-    fprintf(stderr, "[WAN-ADMIN] RESTORE OK %s dp=%d (traffic on, XDP/UMEM untouched)\n",
-            ifname, di);
-    fflush(stderr);
+    main_diag_log(MAIN_DIAG_INFO, "WAN-ADMIN",
+                  "%s restored (dataplane slot %d)", ifname, di);
     return 0;
 }
-

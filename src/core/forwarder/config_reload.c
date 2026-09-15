@@ -5,11 +5,11 @@
 #include "../../../inc/core/iface/profile_iface_xdp.h"
 #include "../../../inc/core/failover/wan_failover.h"
 #include "../../../inc/core/flow/mac_learn.h"
+#include "../../../inc/core/util/main_diag.h"
 #include "../../../inc/crypto/pqc_handshake.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
-#include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <time.h>
@@ -32,7 +32,8 @@ static int wait_dataplane_workers(struct forwarder *fwd)
             return -1;
         usleep(10000);
     }
-    fprintf(stderr, "[RELOAD] dataplane workers not ready yet (still starting)\n");
+    main_diag_log(MAIN_DIAG_WARN, "RELOAD",
+                  "dataplane workers are not ready");
     return -1;
 }
 
@@ -85,14 +86,12 @@ static int forwarder_reload_config_impl(struct forwarder *fwd, struct app_config
     if (cfg->crypto_enabled) {
         pqc_handshake_start_all_profiles(cfg);
     }
-    if (forwarder_should_stop()) {
-        fprintf(stderr, "[RELOAD] aborted before crypto rebuild (stop requested)\n");
+    if (forwarder_should_stop())
         return -1;
-    }
     fwd_crypto_snapshot_active_to_prev();
     int rc = fwd_crypto_rebuild(cfg);
     if (rc != 0)
-        fprintf(stderr, "[RELOAD] fwd_crypto_rebuild failed\n");
+        main_diag_log(MAIN_DIAG_ERROR, "RELOAD", "crypto rebuild failed");
     if (forwarder_should_stop())
         return -1;
     if (rc != 0)
@@ -116,10 +115,8 @@ static int forwarder_queue_reload(struct forwarder *fwd, struct app_config *cfg)
     if (atomic_load_explicit(&reload_pending, memory_order_acquire) &&
         !atomic_load_explicit(&reload_done, memory_order_acquire)) {
         pthread_mutex_unlock(&reload_wait_mtx);
-        fprintf(stderr,
-                "[RELOAD] busy — another reload already in flight "
-                "(single pending slot; serialize profile edits and retry)\n");
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_WARN, "RELOAD",
+                      "another reload is already in flight");
         return -1;
     }
 
@@ -153,10 +150,8 @@ static int forwarder_queue_reload(struct forwarder *fwd, struct app_config *cfg)
         }
         int wr = pthread_cond_timedwait(&reload_wait_cv, &reload_wait_mtx, &ts);
         if (have_deadline && wr == ETIMEDOUT) {
-            fprintf(stderr,
-                    "[RELOAD] timed out waiting for mid core (60s) — cancel pending reload "
-                    "(dataplane unchanged; retry -id notify)\n");
-            fflush(stderr);
+            main_diag_log(MAIN_DIAG_ERROR, "RELOAD",
+                          "timed out waiting 60s for dataplane apply");
             atomic_store_explicit(&reload_pending, 0, memory_order_release);
             break;
         }
@@ -169,12 +164,13 @@ static int forwarder_queue_reload(struct forwarder *fwd, struct app_config *cfg)
     if (forwarder_should_stop())
         return -1;
     if (!finished) {
-        fprintf(stderr, "[RELOAD] mid core did not finish reload (timeout/busy)\n");
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_ERROR, "RELOAD",
+                      "dataplane did not finish reload");
         return -1;
     }
     if (rc != 0)
-        fprintf(stderr, "[RELOAD] apply on mid core failed (rc=%d)\n", rc);
+        main_diag_log(MAIN_DIAG_ERROR, "RELOAD",
+                      "dataplane apply failed (rc=%d)", rc);
     return rc;
 }
 
@@ -185,8 +181,8 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg)
     if (forwarder_should_stop())
         return -1;
     if (!forwarder_same_topology(fwd->cfg, cfg)) {
-        fprintf(stderr,
-                "[RELOAD] LAN/WAN set changed (add/remove interface) — hot reload not possible\n");
+        main_diag_log(MAIN_DIAG_WARN, "RELOAD",
+                      "LAN/WAN topology changed; hot reload is unavailable");
         return -1;
     }
     return forwarder_queue_reload(fwd, cfg);

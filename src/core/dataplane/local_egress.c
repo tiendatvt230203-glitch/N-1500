@@ -9,7 +9,6 @@
 #include "../../../inc/crypto/pqc_handshake.h"
 #include "../../../inc/core/dataplane/crypto_route.h"
 #include "../../../inc/core/dataplane/arp_bridge.h"
-#include "../../../inc/core/dataplane/dataplane_stats.h"
 #include "../../../inc/core/dataplane/dp_idle.h"
 #include "../../../inc/core/flow/flow_table.h"
 
@@ -228,7 +227,6 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
     if (cp->action == POLICY_ACTION_BYPASS) {
         int sent;
 
-        ne_dp_stats_local_bypass(1);
         sent = push_to_wan(fwd, &job, wan_dp) == 0;
         complete_udp_window_after_enqueue(proto, sent);
         return;
@@ -275,6 +273,5 @@ void dataplane_process_local(struct forwarder *fwd, struct ne_packet job)
 
 drop:
     complete_udp_window_after_enqueue(proto, 0);
-    ne_dp_stats_local_drop(1);
     ne_frame_free(&fwd->pair, job.addr);
 }

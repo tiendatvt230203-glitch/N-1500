@@ -10,7 +10,6 @@
 #include "../../../inc/core/iface/interface.h"
 #include "../../../inc/core/flow/mac_learn.h"
 #include "../../../inc/core/dataplane/arp_bridge.h"
-#include "../../../inc/core/dataplane/dataplane_stats.h"
 #include "../../../inc/core/dataplane/udp_reorder.h"
 
 #include <netinet/in.h>
@@ -408,7 +407,6 @@ static int forward_wan_to_local(struct forwarder *fwd, struct ne_packet *job,
         job->local_idx = (uint8_t)li;
         if (dp_ring_push(fwd, &fwd->mid_to_local[li][dp_out_ring_idx()], job) != 0) {
             /* dp_ring_push already returned the UMEM frame to the pool. */
-            ne_dp_stats_wan_drop(1);
             return 1;
         }
         return 0;
@@ -436,7 +434,6 @@ static int udp_reorder_emit(void *ctx, struct dp_udp_reorder_item *item)
         return -1;
     if (rc > 0)
         return 0;
-    ne_dp_stats_wan_fwd(1);
     return 0;
 }
 
@@ -446,7 +443,6 @@ static void udp_reorder_drop(void *ctx, struct dp_udp_reorder_item *item)
 
     if (!fwd || !item)
         return;
-    ne_dp_stats_wan_drop(1);
     ne_frame_free(&fwd->pair, item->packet.addr);
 }
 
@@ -596,17 +592,13 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         if (rc > 0)
             return;
     }
-    ne_dp_stats_wan_fwd(1);
     return;
 
 policy_drop:
-    ne_dp_stats_wan_policy_drop(1);
-    ne_dp_stats_wan_drop(1);
     ne_frame_free(&fwd->pair, job.addr);
     return;
 
 drop:
-    ne_dp_stats_wan_drop(1);
     ne_frame_free(&fwd->pair, job.addr);
 }
 

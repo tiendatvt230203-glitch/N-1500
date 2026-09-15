@@ -1,5 +1,6 @@
 #include "../../inc/db/vault.h"
 #include "../../inc/db/db_env.h"
+#include "../../inc/core/util/main_diag.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -22,11 +23,7 @@ struct ne_vault_cfg {
     char k1[256];
     char k2[256];
     char k3[256];
-    int debug; /* 0/1: dump POSTGRES_* from Vault to stderr */
 };
-
-/* Effective debug flag after reading .env (compile default + NE_VAULT_DEBUG). */
-static int g_ne_vault_debug = NE_VAULT_DEBUG_LOG;
 
 static void strip_env_quotes(char *val)
 {
@@ -51,7 +48,6 @@ static int ne_vault_key_allowed(const char *key)
         "UNSEAL_KEY_1",
         "UNSEAL_KEY_2",
         "UNSEAL_KEY_3",
-        "NE_VAULT_DEBUG", /* 0|1 dump DB secrets from Vault */
         NULL
     };
 
@@ -114,12 +110,12 @@ static int ne_vault_load_cfg(struct ne_vault_cfg *cfg)
 
     memset(cfg, 0, sizeof(*cfg));
     cfg->port = 8200;
-    cfg->debug = NE_VAULT_DEBUG_LOG;
     strncpy(cfg->host, "127.0.0.1", sizeof(cfg->host) - 1);
 
     fp = fopen(NE_ENV_FILE, "r");
     if (!fp) {
-        fprintf(stderr, "[VAULT] Could not open: " NE_ENV_FILE "\n");
+        main_diag_log(MAIN_DIAG_ERROR, "VAULT",
+                      "cannot open %s: %s", NE_ENV_FILE, strerror(errno));
         return -1;
     }
 
@@ -172,27 +168,14 @@ static int ne_vault_load_cfg(struct ne_vault_cfg *cfg)
             strncpy(cfg->k2, val, sizeof(cfg->k2) - 1);
         else if (strcmp(key, "UNSEAL_KEY_3") == 0)
             strncpy(cfg->k3, val, sizeof(cfg->k3) - 1);
-        else if (strcmp(key, "NE_VAULT_DEBUG") == 0)
-            cfg->debug = (val[0] == '1') ? 1 : 0;
     }
 
     fclose(fp);
-
-    g_ne_vault_debug = cfg->debug ? 1 : 0;
-    setenv("NE_VAULT_DEBUG", g_ne_vault_debug ? "1" : "0", 1);
 
     if (cfg->addr[0])
         setenv("VAULT_ADDR", cfg->addr, 1);
     if (cfg->token[0])
         setenv("VAULT_TOKEN", cfg->token, 1);
-
-    fprintf(stderr,
-            "[VAULT] config from " NE_ENV_FILE
-            " (addr=%s unseal_keys=%d token=%s debug=%d)\n",
-            cfg->addr[0] ? cfg->addr : "-",
-            (cfg->k1[0] ? 1 : 0) + (cfg->k2[0] ? 1 : 0) + (cfg->k3[0] ? 1 : 0),
-            cfg->token[0] ? "set" : "missing",
-            g_ne_vault_debug);
 
     return 0;
 }
@@ -242,8 +225,9 @@ static int ne_vault_http_request(const struct ne_vault_cfg *cfg, const char *met
     }
 
     if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        fprintf(stderr, "[VAULT] HTTP connect %s:%d failed: %s\n",
-                cfg->host, cfg->port, strerror(errno));
+        main_diag_log(MAIN_DIAG_ERROR, "VAULT",
+                      "HTTP connect %s:%d failed: %s",
+                      cfg->host, cfg->port, strerror(errno));
         close(sockfd);
         return -1;
     }
@@ -364,14 +348,13 @@ static int ne_vault_http_unseal_key(const struct ne_vault_cfg *cfg, const char *
     snprintf(payload, sizeof(payload), "{\"key\":\"%s\"}", key);
     if (ne_vault_http_request(cfg, "POST", "/v1/sys/unseal", payload,
                               response, sizeof(response)) < 0) {
-        fprintf(stderr, "[VAULT] HTTP unseal request failed\n");
+        main_diag_log(MAIN_DIAG_ERROR, "VAULT", "HTTP unseal request failed");
         return -1;
     }
     status = ne_vault_http_status(response);
     if (status == 400 || status == 500) {
-        fprintf(stderr,
-                "[VAULT] unseal rejected (HTTP %d) — UNSEAL_KEY likely wrong\n",
-                status);
+        main_diag_log(MAIN_DIAG_ERROR, "VAULT",
+                      "unseal rejected (HTTP %d)", status);
         return -1;
     }
     return ne_vault_json_bool_false(response, "sealed") ? 0 : 1;
@@ -416,29 +399,6 @@ static int ne_vault_kv_apply_from_json(const char *json)
     return loaded;
 }
 
-static void ne_vault_log_loaded_secrets(void)
-{
-    const char *db = getenv("POSTGRES_DB");
-    const char *pass = getenv("POSTGRES_PASSWORD");
-    const char *port = getenv("POSTGRES_PORT");
-    const char *user = getenv("POSTGRES_USER");
-
-    if (!g_ne_vault_debug)
-        return;
-
-    fprintf(stderr,
-            "[VAULT-DEBUG] DB from Vault " NE_VAULT_SECRET_PATH ":\n"
-            "  \"POSTGRES_DB\": \"%s\",\n"
-            "  \"POSTGRES_PASSWORD\": \"%s\",\n"
-            "  \"POSTGRES_PORT\": \"%s\",\n"
-            "  \"POSTGRES_USER\": \"%s\",\n",
-            (db && db[0]) ? db : "",
-            (pass && pass[0]) ? pass : "",
-            (port && port[0]) ? port : "",
-            (user && user[0]) ? user : "");
-    fflush(stderr);
-}
-
 static void ne_vault_kv_api_path(char *out, size_t outsz)
 {
     const char *p = NE_VAULT_SECRET_PATH;
@@ -470,7 +430,8 @@ static int ne_vault_kv_get_and_apply(const struct ne_vault_cfg *cfg)
         snprintf(api_path, sizeof(api_path), "/v1/%s", NE_VAULT_SECRET_PATH);
         if (ne_vault_http_request(cfg, "GET", api_path, NULL,
                                   response, NE_VAULT_HTTP_BUF) < 0) {
-            fprintf(stderr, "[VAULT] HTTP kv get failed for " NE_VAULT_SECRET_PATH "\n");
+            main_diag_log(MAIN_DIAG_ERROR, "VAULT",
+                          "HTTP read failed for %s", NE_VAULT_SECRET_PATH);
             free(response);
             return -1;
         }
@@ -478,24 +439,22 @@ static int ne_vault_kv_get_and_apply(const struct ne_vault_cfg *cfg)
 
     status = ne_vault_http_status(response);
     if (status == 401 || status == 403) {
-        fprintf(stderr,
-                "[VAULT] cannot read " NE_VAULT_SECRET_PATH
-                " (HTTP %d) — VAULT_TOKEN wrong or permission denied\n",
-                status);
+        main_diag_log(MAIN_DIAG_ERROR, "VAULT",
+                      "cannot read %s (HTTP %d)", NE_VAULT_SECRET_PATH,
+                      status);
         free(response);
         return -1;
     }
     if (status == 404) {
-        fprintf(stderr,
-                "[VAULT] secret path " NE_VAULT_SECRET_PATH
-                " not found (HTTP 404) — empty/missing in Vault\n");
+        main_diag_log(MAIN_DIAG_ERROR, "VAULT",
+                      "secret path %s not found", NE_VAULT_SECRET_PATH);
         free(response);
         return -1;
     }
     if (status > 0 && (status < 200 || status >= 300)) {
-        fprintf(stderr,
-                "[VAULT] kv get " NE_VAULT_SECRET_PATH " failed (HTTP %d)\n",
-                status);
+        main_diag_log(MAIN_DIAG_ERROR, "VAULT",
+                      "read %s failed (HTTP %d)", NE_VAULT_SECRET_PATH,
+                      status);
         free(response);
         return -1;
     }
@@ -515,9 +474,8 @@ static int ne_vault_kv_get_and_apply(const struct ne_vault_cfg *cfg)
     free(response);
 
     if (loaded == 0) {
-        fprintf(stderr,
-                "[VAULT] " NE_VAULT_SECRET_PATH
-                " empty — no POSTGRES_DB/PASSWORD/PORT/USER fields\n");
+        main_diag_log(MAIN_DIAG_ERROR, "VAULT",
+                      "%s has no PostgreSQL fields", NE_VAULT_SECRET_PATH);
         return -1;
     }
     return 0;
@@ -541,23 +499,23 @@ static int ne_vault_verify_postgres_env(void)
         host = getenv("POSTGRES_HOST");
 
     if (!host || !host[0]) {
-        fprintf(stderr, "[VAULT] missing POSTGRES_SERVER in " NE_VAULT_SECRET_PATH "\n");
+        main_diag_log(MAIN_DIAG_ERROR, "VAULT", "missing POSTGRES_SERVER");
         return -1;
     }
     if (!port || !port[0]) {
-        fprintf(stderr, "[VAULT] missing POSTGRES_PORT in " NE_VAULT_SECRET_PATH "\n");
+        main_diag_log(MAIN_DIAG_ERROR, "VAULT", "missing POSTGRES_PORT");
         return -1;
     }
     if (!user || !user[0]) {
-        fprintf(stderr, "[VAULT] missing POSTGRES_USER in " NE_VAULT_SECRET_PATH "\n");
+        main_diag_log(MAIN_DIAG_ERROR, "VAULT", "missing POSTGRES_USER");
         return -1;
     }
     if (!dbname || !dbname[0]) {
-        fprintf(stderr, "[VAULT] missing POSTGRES_DB in " NE_VAULT_SECRET_PATH "\n");
+        main_diag_log(MAIN_DIAG_ERROR, "VAULT", "missing POSTGRES_DB");
         return -1;
     }
     if (!pass || !pass[0]) {
-        fprintf(stderr, "[VAULT] missing POSTGRES_PASSWORD in " NE_VAULT_SECRET_PATH "\n");
+        main_diag_log(MAIN_DIAG_ERROR, "VAULT", "missing POSTGRES_PASSWORD");
         return -1;
     }
     return 0;
@@ -573,25 +531,21 @@ int ne_vault_unseal_and_login(void)
         return -1;
 
     if (!ne_vault_cfg_present(&cfg)) {
-        fprintf(stderr,
-                "[VAULT] missing VAULT_ADDR/TOKEN/UNSEAL_KEY_1/2/3 in "
-                NE_ENV_FILE "\n");
+        main_diag_log(MAIN_DIAG_ERROR, "VAULT",
+                      "missing address, token, or unseal keys in %s",
+                      NE_ENV_FILE);
         return -1;
     }
-
-    fprintf(stderr, "[VAULT] unseal via HTTP addr=%s (timeout=%ds)\n",
-            cfg.addr, NE_VAULT_HTTP_TIMEOUT_SEC);
 
     if (ne_vault_http_request(&cfg, "GET", "/v1/sys/seal-status", NULL,
                               response, sizeof(response)) < 0) {
-        fprintf(stderr, "[VAULT] seal-status request failed\n");
+        main_diag_log(MAIN_DIAG_ERROR, "VAULT",
+                      "seal status request failed");
         return -1;
     }
 
-    if (ne_vault_json_bool_false(response, "sealed")) {
-        fprintf(stderr, "[VAULT] unseal ok (already unsealed)\n");
+    if (ne_vault_json_bool_false(response, "sealed"))
         return 0;
-    }
 
     if (cfg.k1[0] && ne_vault_http_unseal_key(&cfg, cfg.k1) < 0)
         fail = 1;
@@ -602,23 +556,22 @@ int ne_vault_unseal_and_login(void)
 
     if (ne_vault_http_request(&cfg, "GET", "/v1/sys/seal-status", NULL,
                               response, sizeof(response)) < 0) {
-        fprintf(stderr, "[VAULT] seal-status verify failed\n");
+        main_diag_log(MAIN_DIAG_ERROR, "VAULT",
+                      "seal status verification failed");
         return -1;
     }
 
     if (!ne_vault_json_bool_false(response, "sealed")) {
-        fprintf(stderr,
-                "[VAULT] still sealed after UNSEAL_KEY_1/2/3 — keys wrong or incomplete\n");
+        main_diag_log(MAIN_DIAG_ERROR, "VAULT",
+                      "Vault remains sealed after applying configured keys");
         fail = 1;
     }
 
     if (fail) {
-        fprintf(stderr,
-                "[VAULT] unseal/login failed with keys+token from " NE_ENV_FILE "\n");
+        main_diag_log(MAIN_DIAG_ERROR, "VAULT", "unseal or login failed");
         return -1;
     }
 
-    fprintf(stderr, "[VAULT] unseal ok\n");
     return 0;
 }
 
@@ -630,16 +583,13 @@ int ne_vault_load_secrets(void)
         return -1;
 
     if (!cfg.addr[0]) {
-        fprintf(stderr, "[VAULT] missing VAULT_ADDR in " NE_ENV_FILE "\n");
+        main_diag_log(MAIN_DIAG_ERROR, "VAULT", "missing VAULT_ADDR");
         return -1;
     }
     if (!cfg.token[0]) {
-        fprintf(stderr, "[VAULT] missing VAULT_TOKEN in " NE_ENV_FILE "\n");
+        main_diag_log(MAIN_DIAG_ERROR, "VAULT", "missing VAULT_TOKEN");
         return -1;
     }
-
-    fprintf(stderr, "[VAULT] HTTP kv get " NE_VAULT_SECRET_PATH
-            " (timeout=%ds)\n", NE_VAULT_HTTP_TIMEOUT_SEC);
 
     if (ne_vault_kv_get_and_apply(&cfg) != 0)
         return -1;
@@ -647,7 +597,5 @@ int ne_vault_load_secrets(void)
     if (ne_vault_verify_postgres_env() != 0)
         return -1;
 
-    ne_vault_log_loaded_secrets();
-    fprintf(stderr, "[VAULT] POSTGRES_* loaded from " NE_VAULT_SECRET_PATH "\n");
     return 0;
 }

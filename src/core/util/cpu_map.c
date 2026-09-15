@@ -1,9 +1,10 @@
 #include "../../../inc/core/util/cpu_map.h"
+#include "../../../inc/core/util/main_diag.h"
 
 #include <sched.h>
-#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 
 static int validate_group(const char *name, const uint8_t *cpus, uint32_t count,
                           const cpu_set_t *allowed, uint8_t seen[CPU_SETSIZE])
@@ -12,13 +13,15 @@ static int validate_group(const char *name, const uint8_t *cpus, uint32_t count,
         unsigned int cpu = cpus[i];
 
         if (cpu >= CPU_SETSIZE || !CPU_ISSET(cpu, allowed)) {
-            fprintf(stderr, "[DP-CONF] %s[%u]=CPU%u is offline or outside cpuset\n",
-                    name, i, cpu);
+            main_diag_log(MAIN_DIAG_ERROR, "DP-CONF",
+                          "%s[%u]=CPU%u is offline or outside cpuset",
+                          name, i, cpu);
             return -1;
         }
         if (seen[cpu]) {
-            fprintf(stderr, "[DP-CONF] CPU%u is assigned to more than one dataplane role\n",
-                    cpu);
+            main_diag_log(MAIN_DIAG_ERROR, "DP-CONF",
+                          "CPU%u is assigned to more than one dataplane role",
+                          cpu);
             return -1;
         }
         seen[cpu] = 1;
@@ -34,7 +37,8 @@ int ne_cpu_map_validate(void)
     CPU_ZERO(&allowed);
     memset(seen, 0, sizeof(seen));
     if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
-        perror("[DP-CONF] sched_getaffinity");
+        main_diag_log(MAIN_DIAG_ERROR, "DP-CONF",
+                      "sched_getaffinity failed: %s", strerror(errno));
         return -1;
     }
     if (validate_group("RX_LAN", NE_CPU_RX_LAN, NE_RX_LAN_SLOTS,
@@ -46,22 +50,4 @@ int ne_cpu_map_validate(void)
                        &allowed, seen) != 0)
         return -1;
     return 0;
-}
-
-void ne_cpu_map_log(void)
-{
-    fprintf(stderr, "[DP-CONF] RX_LAN (%u):", (unsigned)NE_RX_LAN_SLOTS);
-    for (uint32_t i = 0; i < NE_RX_LAN_SLOTS; i++)
-        fprintf(stderr, " %u", (unsigned)NE_CPU_RX_LAN[i]);
-    fprintf(stderr, "\n[DP-CONF] TX (%u):", (unsigned)NE_TX_SLOTS);
-    for (uint32_t i = 0; i < NE_TX_SLOTS; i++)
-        fprintf(stderr, " %u", (unsigned)NE_CPU_TX[i]);
-    fprintf(stderr, "\n[DP-CONF] CRYPTO (%u):", (unsigned)NE_CRYPTO_WORKERS);
-    for (uint32_t i = 0; i < NE_CRYPTO_WORKERS; i++)
-        fprintf(stderr, " %u", (unsigned)NE_CPU_CRYPTO[i]);
-    fprintf(stderr, "\n[DP-CONF] RX_WAN (%u):", (unsigned)NE_RX_WAN_SLOTS);
-    for (uint32_t i = 0; i < NE_RX_WAN_SLOTS; i++)
-        fprintf(stderr, " %u", (unsigned)NE_CPU_RX_WAN[i]);
-    fprintf(stderr, "\n");
-    fflush(stderr);
 }

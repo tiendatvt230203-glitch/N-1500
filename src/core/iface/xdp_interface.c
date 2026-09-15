@@ -1,6 +1,6 @@
 #include "../../../inc/core/iface/interface.h"
 #include "../../../inc/core/iface/profile_iface_xdp.h"
-#include "../../../inc/core/dataplane/dataplane_stats.h"
+#include "../../../inc/core/util/main_diag.h"
 #include <bpf/libbpf.h>
 #include <linux/if_link.h>
 #include <linux/if_xdp.h>
@@ -17,38 +17,6 @@
 #include <dirent.h>
 #include <stdlib.h>
 #include <unistd.h>
-
-static __thread const char *tls_dp_tx_dir;
-static __thread int tls_dp_tx_slot = -1;
-
-void ne_dp_tx_ctx(const char *dir, int tx_slot)
-{
-    tls_dp_tx_dir = dir;
-    tls_dp_tx_slot = tx_slot;
-}
-
-void ne_dp_warn_rx(const char *dir, int cpu, int batch_rcvd)
-{
-    (void)dir;
-    (void)cpu;
-    (void)batch_rcvd;
-}
-
-void ne_dp_warn_rx_drop(const char *dir, int cpu, int worker, uint32_t q_depth)
-{
-    (void)dir;
-    (void)cpu;
-    (void)worker;
-    (void)q_depth;
-}
-
-void ne_dp_warn_crypto(int cpu, int worker, uint32_t lan_q, uint32_t wan_q)
-{
-    (void)cpu;
-    (void)worker;
-    (void)lan_q;
-    (void)wan_q;
-}
 
 static int ne_rx_slots_for_queues(int queue_total, uint32_t slots_max)
 {
@@ -492,12 +460,11 @@ static void interface_log_xsk_context(const char *ifname, int queue_id, int ret)
     }
     mtu = interface_get_mtu(ifname);
     nq = interface_get_queue_count(ifname);
-    fprintf(stderr,
-            "[DP] XSK create failed %s q=%d: %s (%d) — mtu=%d queues=%d frame=%u master=%s%s\n",
+    main_diag_log(MAIN_DIAG_ERROR, "XDP",
+            "XSK create failed %s q=%d: %s (%d), mtu=%d queues=%d frame=%u master=%s%s",
             ifname, queue_id, strerror(err), ret, mtu, nq, NE_FRAME,
             master[0] ? master : "-",
             interface_is_bridge_slave(ifname) ? " (bridge-slave, Br kept)" : "");
-    fflush(stderr);
 }
 
 static int interface_preflight(const char *ifname)
@@ -505,13 +472,11 @@ static int interface_preflight(const char *ifname)
     if (!ifname_is_safe(ifname))
         return -1;
     if (if_nametoindex(ifname) == 0) {
-        fprintf(stderr, "[DP] %s: interface not found\n", ifname);
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_ERROR, "XDP", "%s: interface not found", ifname);
         return -1;
     }
     if (!interface_is_up(ifname)) {
-        fprintf(stderr, "[DP] %s: link is DOWN\n", ifname);
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_ERROR, "XDP", "%s: link is down", ifname);
         return -1;
     }
     /* Br membership is intentional (customer default) — do not reject. */
@@ -707,12 +672,9 @@ static int ne_pair_destroy_umem(struct ne_pair *p)
     if (!p->bufs || p->bufs == MAP_FAILED || p->n_frames == 0)
         return 0;
     if (pool_reset_full(&p->pool, p->n_frames, p->frame_size) != 0) {
-        fprintf(stderr, "[DP] umem destroy: pool reset failed\n");
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_ERROR, "XDP", "UMEM pool reset failed during destroy");
         return -1;
     }
-    fprintf(stderr, "[DP] umem cleared — next LAN plumb will create fresh\n");
-    fflush(stderr);
     return 0;
 }
 
@@ -733,8 +695,7 @@ static int ne_pair_create_umem_on_local(struct ne_pair *p, int pair_li)
         return 0;
 
     if (pool_reset_full(&p->pool, p->n_frames, p->frame_size) != 0) {
-        fprintf(stderr, "[DP] umem create: pool reset failed\n");
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_ERROR, "XDP", "UMEM pool reset failed during create");
         return -1;
     }
 
@@ -744,15 +705,12 @@ static int ne_pair_create_umem_on_local(struct ne_pair *p, int pair_li)
     if (xsk_umem__create(&p->umem, p->bufs, p->bufsize,
                          &p->locals[pair_li].queues[0].fq,
                          &p->locals[pair_li].queues[0].cq, &ucfg) != 0) {
-        fprintf(stderr, "[DP] umem create on LAN slot %d failed: %s\n",
+        main_diag_log(MAIN_DIAG_ERROR, "XDP", "UMEM create on LAN slot %d failed: %s",
                 pair_li, strerror(errno));
-        fflush(stderr);
         return -1;
     }
     p->umem_fq_li = pair_li;
     p->umem_fq_q = 0;
-    fprintf(stderr, "[DP] fresh umem on LAN slot %d\n", pair_li);
-    fflush(stderr);
     return 0;
 }
 
@@ -816,8 +774,8 @@ static int open_iface_queues(struct ne_pair *p, struct ne_iface *iface,
 
     iface->ifindex = (int)if_nametoindex(ifname);
     if (!iface->ifindex) {
-        fprintf(stderr, "[DP] XSK open failed %s: interface not found\n", ifname);
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_ERROR, "XDP",
+                      "XSK open failed for %s: interface not found", ifname);
         return -1;
     }
     strncpy(iface->ifname, ifname, sizeof(iface->ifname) - 1);
@@ -963,10 +921,6 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
                                    p->locals[i].queue_count);
         if (rc) {
             /* One scrub+retry — common after rapid delete/recreate. */
-            fprintf(stderr,
-                    "[DP] LAN %s XSK bind failed — scrub XDP and retry once\n",
-                    cfg->locals[i].ifname);
-            fflush(stderr);
             profile_iface_xdp_detach_ifname(cfg->locals[i].ifname);
             usleep(150000);
             rc = open_iface_queues(p, &p->locals[i], cfg->locals[i].ifname,
@@ -982,10 +936,6 @@ int ne_pair_open(struct ne_pair *p, const struct app_config *cfg)
         rc = open_iface_queues(p, &p->wans[di], cfg->wans[ci].ifname,
                                p->wans[di].queue_count);
         if (rc) {
-            fprintf(stderr,
-                    "[DP] WAN %s XSK bind failed — scrub XDP and retry once\n",
-                    cfg->wans[ci].ifname);
-            fflush(stderr);
             profile_iface_xdp_detach_ifname(cfg->wans[ci].ifname);
             usleep(150000);
             rc = open_iface_queues(p, &p->wans[di], cfg->wans[ci].ifname,
@@ -1021,12 +971,8 @@ void ne_pair_close(struct ne_pair *p, const struct app_config *cfg)
         return;
 
 
-    fprintf(stderr, "[STOP] ne_pair_close: (1/4) delete XSK\n");
-    fflush(stderr);
     delete_all_live_xsks(p);
 
-    fprintf(stderr, "[STOP] ne_pair_close: (2/4) close BPF\n");
-    fflush(stderr);
     for (int i = 0; i < p->local_count; i++) {
         if (p->bpf_locals[i]) {
             bpf_object__close(p->bpf_locals[i]);
@@ -1042,8 +988,6 @@ void ne_pair_close(struct ne_pair *p, const struct app_config *cfg)
         p->xdp_wan_on[i] = 0;
     }
 
-    fprintf(stderr, "[STOP] ne_pair_close: (3/4) ip link xdp off\n");
-    fflush(stderr);
     if (cfg)
         profile_iface_xdp_detach_config(cfg);
     else {
@@ -1057,8 +1001,6 @@ void ne_pair_close(struct ne_pair *p, const struct app_config *cfg)
         }
     }
 
-    fprintf(stderr, "[STOP] ne_pair_close: (4/4) delete UMEM\n");
-    fflush(stderr);
     if (p->umem) {
         xsk_umem__delete(p->umem);
         p->umem = NULL;
@@ -1103,15 +1045,14 @@ int ne_pair_plumb_local(struct ne_pair *p, const struct app_config *cfg, int cfg
 
     int nq = resolve_iface_queue_count(ifname);
     if (apply_iface_queue_count(ifname, nq) != 0) {
-        fprintf(stderr, "[DP] plumb LAN %s: queue_count apply failed (want=%d)\n",
+        main_diag_log(MAIN_DIAG_ERROR, "XDP",
+                "plumb LAN %s: queue-count apply failed (want=%d)",
                 ifname, nq);
-        fflush(stderr);
         return -1;
     }
     p->locals[pair_li].queue_count = nq;
     if (interface_set_promisc(ifname) != 0) {
-        fprintf(stderr, "[DP] plumb LAN %s: promisc on failed\n", ifname);
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_ERROR, "XDP", "plumb LAN %s: promisc failed", ifname);
         return -1;
     }
     if (!p->umem && ne_pair_create_umem_on_local(p, pair_li) != 0) {
@@ -1119,8 +1060,7 @@ int ne_pair_plumb_local(struct ne_pair *p, const struct app_config *cfg, int cfg
         return -1;
     }
     if (open_iface_queues(p, &p->locals[pair_li], ifname, nq) != 0) {
-        fprintf(stderr, "[DP] plumb LAN %s: open_iface_queues/XSK failed\n", ifname);
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_ERROR, "XDP", "plumb LAN %s: XSK open failed", ifname);
         p->locals[pair_li].queue_count = 0;
         if (p->umem_fq_li == pair_li && ne_pair_other_live_count(p, -1, -1) <= 0)
             (void)ne_pair_destroy_umem(p);
@@ -1152,20 +1092,18 @@ int ne_pair_plumb_wan_dp(struct ne_pair *p, const struct app_config *cfg, int cf
 
     int nq = resolve_iface_queue_count(ifname);
     if (apply_iface_queue_count(ifname, nq) != 0) {
-        fprintf(stderr, "[DP] plumb WAN %s: queue_count apply failed (want=%d)\n",
+        main_diag_log(MAIN_DIAG_ERROR, "XDP",
+                "plumb WAN %s: queue-count apply failed (want=%d)",
                 ifname, nq);
-        fflush(stderr);
         return -1;
     }
     p->wans[dp_slot].queue_count = nq;
     if (interface_set_promisc(ifname) != 0) {
-        fprintf(stderr, "[DP] plumb WAN %s: promisc on failed\n", ifname);
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_ERROR, "XDP", "plumb WAN %s: promisc failed", ifname);
         return -1;
     }
     if (open_iface_queues(p, &p->wans[dp_slot], ifname, nq) != 0) {
-        fprintf(stderr, "[DP] plumb WAN %s: open_iface_queues/XSK failed\n", ifname);
-        fflush(stderr);
+        main_diag_log(MAIN_DIAG_ERROR, "XDP", "plumb WAN %s: XSK open failed", ifname);
         p->wans[dp_slot].queue_count = 0;
         return -1;
     }
@@ -1208,9 +1146,6 @@ int ne_pair_teardown_live(struct ne_pair *p)
 {
     if (!p)
         return -1;
-
-    fprintf(stderr, "[DP] teardown all live XSK + clear UMEM\n");
-    fflush(stderr);
 
     for (int i = 0; i < MAX_INTERFACES; i++) {
         if (p->local_live[i] || p->locals[i].queue_count > 0 || p->bpf_locals[i])
@@ -1624,12 +1559,6 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
     if (!free_slots) {
         if (tx_no_free)
             (*tx_no_free)++;
-        if (tls_dp_tx_dir && tls_dp_tx_slot >= 0) {
-            if (tls_dp_tx_dir[0] == 'L' || tls_dp_tx_dir[0] == 'l')
-                ne_dp_stats_tx_full_lan(tls_dp_tx_slot, 1);
-            else
-                ne_dp_stats_tx_full_wan(tls_dp_tx_slot, 1);
-        }
         if (xsk_ring_prod__needs_wakeup(&slot->tx)) {
             (void)sendto(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
         }
@@ -1661,15 +1590,6 @@ static int tx_drain_queue(struct ne_xsk_queue *slot, struct ne_ring *src, uint32
     xsk_ring_prod__submit(&slot->tx, popped);
     if (xsk_ring_prod__needs_wakeup(&slot->tx)) {
         (void)sendto(xsk_socket__fd(slot->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-    }
-    if (tls_dp_tx_dir && tls_dp_tx_slot >= 0) {
-        uint64_t tx_bytes = 0;
-        for (uint32_t i = 0; i < popped; i++)
-            tx_bytes += jobs[i].len;
-        if (tls_dp_tx_dir[0] == 'L' || tls_dp_tx_dir[0] == 'l')
-            ne_dp_stats_tx_lan(tls_dp_tx_slot, popped, tx_bytes);
-        else
-            ne_dp_stats_tx_wan(tls_dp_tx_slot, popped, tx_bytes);
     }
     return (int)popped;
 }
