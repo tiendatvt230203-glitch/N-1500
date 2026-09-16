@@ -30,6 +30,9 @@ int crypto_option_udp_tx_meta(uint32_t *epoch, uint32_t *seq,
 void crypto_option_udp_clear_rx_meta(void);
 void crypto_option_udp_set_rx_meta(uint32_t epoch, uint32_t seq);
 int crypto_option_udp_take_rx_meta(uint32_t *epoch, uint32_t *seq);
+void crypto_option_tcp_clear_rx_meta(void);
+void crypto_option_tcp_set_rx_meta(uint32_t epoch, uint32_t seq);
+int crypto_option_tcp_take_rx_meta(uint32_t *epoch, uint32_t *seq);
 void crypto_option_set_mtu(uint32_t mtu);
 uint32_t crypto_option_get_mtu(void);
 

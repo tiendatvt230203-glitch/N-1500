@@ -11,6 +11,7 @@
 #include "../../../inc/core/flow/mac_learn.h"
 #include "../../../inc/core/dataplane/arp_bridge.h"
 #include "../../../inc/core/dataplane/udp_reorder.h"
+#include "../../../inc/core/dataplane/tcp_bond_reorder.h"
 
 #include <netinet/in.h>
 #include <string.h>
@@ -457,6 +458,43 @@ static struct dp_udp_reorder_ops udp_reorder_ops(struct forwarder *fwd)
     return ops;
 }
 
+static int tcp_bond_reorder_emit(void *ctx, struct dp_tcp_bond_item *item)
+{
+    struct forwarder *fwd = ctx;
+    uint8_t *pkt;
+    int rc;
+
+    if (!fwd || !item)
+        return -1;
+    pkt = ne_packet_data(&fwd->pair, item->packet.addr);
+    if (!pkt)
+        return -1;
+    dp_out_ring_bind(dp_flow_pick_tx_slot(pkt, item->packet.len,
+                                          dp_crypto_current_worker_idx()));
+    rc = forward_wan_to_local(fwd, &item->packet, item->profile_pi,
+                              item->ingress_wan_dp);
+    return rc < 0 ? -1 : 0;
+}
+
+static void tcp_bond_reorder_drop(void *ctx, struct dp_tcp_bond_item *item)
+{
+    struct forwarder *fwd = ctx;
+
+    if (fwd && item)
+        ne_frame_free(&fwd->pair, item->packet.addr);
+}
+
+static struct dp_tcp_bond_ops tcp_bond_reorder_ops(struct forwarder *fwd)
+{
+    struct dp_tcp_bond_ops ops = {
+        .ctx = fwd,
+        .emit = tcp_bond_reorder_emit,
+        .drop = tcp_bond_reorder_drop,
+    };
+
+    return ops;
+}
+
 void dataplane_udp_reorder_configure(void)
 {
     dp_udp_reorder_configure_from_env();
@@ -474,6 +512,25 @@ void dataplane_udp_reorder_reset(struct forwarder *fwd, int worker_idx)
     struct dp_udp_reorder_ops ops = udp_reorder_ops(fwd);
 
     dp_udp_reorder_reset_worker(worker_idx, &ops);
+}
+
+void dataplane_tcp_bond_reorder_configure(void)
+{
+    dp_tcp_bond_reorder_configure_from_env();
+}
+
+void dataplane_tcp_bond_reorder_gc(struct forwarder *fwd)
+{
+    struct dp_tcp_bond_ops ops = tcp_bond_reorder_ops(fwd);
+
+    dp_tcp_bond_reorder_gc(dp_tcp_bond_reorder_now_ns(), &ops);
+}
+
+void dataplane_tcp_bond_reorder_reset(struct forwarder *fwd)
+{
+    struct dp_tcp_bond_ops ops = tcp_bond_reorder_ops(fwd);
+
+    dp_tcp_bond_reorder_reset(&ops);
 }
 
 int dataplane_wan_needs_mid(struct forwarder *fwd, const uint8_t *pkt, uint32_t len)
@@ -523,6 +580,7 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
         goto drop;
     if (encrypted) {
         crypto_option_udp_clear_rx_meta();
+        crypto_option_tcp_clear_rx_meta();
         if (!fwd->cfg->crypto_enabled)
             goto drop;
         dec = decrypt_wan(fwd, &job);
@@ -574,6 +632,26 @@ void dataplane_process_wan(struct forwarder *fwd, struct ne_packet job)
             dp_udp_reorder_submit(dp_crypto_current_worker_idx(), &key,
                                   epoch, seq, &item,
                                   dp_udp_reorder_now_ns(), &ops);
+            return;
+        }
+        if (crypto_option_tcp_take_rx_meta(&epoch, &seq) == 0) {
+            struct dp_tcp_bond_item item;
+            struct dp_tcp_bond_ops ops = tcp_bond_reorder_ops(fwd);
+            uint32_t src_ip = 0, dst_ip = 0;
+            uint16_t src_port = 0, dst_port = 0;
+            uint8_t proto = 0;
+
+            if (dp_parse_flow(pkt, job.len, &src_ip, &dst_ip,
+                              &src_port, &dst_port, &proto) != 0 ||
+                proto != IPPROTO_TCP)
+                goto drop;
+            memset(&item, 0, sizeof(item));
+            item.packet = job;
+            item.profile_pi = (int16_t)profile_pi;
+            item.ingress_wan_dp = job.wan_idx < fwd->wan_count
+                ? (int8_t)job.wan_idx : -1;
+            dp_tcp_bond_reorder_submit(wire_policy_id, epoch, seq, &item,
+                                       dp_tcp_bond_reorder_now_ns(), &ops);
             return;
         }
         dp_out_ring_bind(dp_flow_pick_tx_slot(pkt, job.len,

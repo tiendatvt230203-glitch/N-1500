@@ -45,10 +45,13 @@ static __thread uint32_t g_udp_rx_epoch;
 static __thread uint32_t g_udp_rx_seq;
 static __thread uint8_t g_udp_tx_valid;
 static __thread uint8_t g_udp_rx_valid;
+static __thread uint32_t g_tcp_rx_epoch;
+static __thread uint32_t g_tcp_rx_seq;
+static __thread uint8_t g_tcp_rx_valid;
 
-static uint32_t crypto_option_udp_epoch(void)
+static uint32_t crypto_option_random_epoch(atomic_uint_fast32_t *storage)
 {
-    uint32_t epoch = (uint32_t)atomic_load_explicit(&g_udp_epoch,
+    uint32_t epoch = (uint32_t)atomic_load_explicit(storage,
                                                     memory_order_acquire);
 
     if (epoch != 0)
@@ -66,12 +69,17 @@ static uint32_t crypto_option_udp_epoch(void)
     {
         uint_fast32_t expected = 0;
 
-        if (!atomic_compare_exchange_strong_explicit(&g_udp_epoch, &expected, epoch,
+        if (!atomic_compare_exchange_strong_explicit(storage, &expected, epoch,
                                                       memory_order_release,
                                                       memory_order_acquire))
             epoch = (uint32_t)expected;
     }
     return epoch;
+}
+
+static uint32_t crypto_option_udp_epoch(void)
+{
+    return crypto_option_random_epoch(&g_udp_epoch);
 }
 
 void crypto_option_udp_set_tx_seq(uint32_t seq)
@@ -114,6 +122,28 @@ int crypto_option_udp_take_rx_meta(uint32_t *epoch, uint32_t *seq)
     return 0;
 }
 
+void crypto_option_tcp_clear_rx_meta(void)
+{
+    g_tcp_rx_valid = 0u;
+}
+
+void crypto_option_tcp_set_rx_meta(uint32_t epoch, uint32_t seq)
+{
+    g_tcp_rx_epoch = epoch;
+    g_tcp_rx_seq = seq;
+    g_tcp_rx_valid = 1u;
+}
+
+int crypto_option_tcp_take_rx_meta(uint32_t *epoch, uint32_t *seq)
+{
+    if (!epoch || !seq || !g_tcp_rx_valid)
+        return -1;
+    *epoch = g_tcp_rx_epoch;
+    *seq = g_tcp_rx_seq;
+    g_tcp_rx_valid = 0u;
+    return 0;
+}
+
 void crypto_option_set_mtu(uint32_t mtu)
 {
     if (mtu < 512)
@@ -134,8 +164,10 @@ uint32_t crypto_option_get_mtu(void)
 uint32_t crypto_option_wire_overhead(crypto_option_id id)
 {
     if (id == CRYPTO_OPT_L2_PQC)
-        /* policy ID + worker ID + nonce + GCM tag; EtherType is replaced. */
-        return 1u + 1u + PACKET_CRYPTO_NONCE_BYTES + AES_GCM_TAG_SIZE;
+        /* TCP adds marker + authenticated epoch/sequence shim. EtherType is
+         * replaced, so its two bytes are not additional wire overhead. */
+        return 1u + 1u + PACKET_CRYPTO_NONCE_BYTES + AES_GCM_TAG_SIZE +
+            4u + 9u;
     return 0u;
 }
 

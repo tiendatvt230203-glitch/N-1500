@@ -14,5 +14,8 @@ int dataplane_wan_needs_mid(struct forwarder *fwd, const uint8_t *pkt, uint32_t 
 void dataplane_udp_reorder_configure(void);
 void dataplane_udp_reorder_gc(struct forwarder *fwd, int worker_idx);
 void dataplane_udp_reorder_reset(struct forwarder *fwd, int worker_idx);
+void dataplane_tcp_bond_reorder_configure(void);
+void dataplane_tcp_bond_reorder_gc(struct forwarder *fwd);
+void dataplane_tcp_bond_reorder_reset(struct forwarder *fwd);
 
 #endif

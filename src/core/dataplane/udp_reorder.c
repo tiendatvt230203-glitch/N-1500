@@ -8,21 +8,22 @@
 #include <string.h>
 #include <time.h>
 
-#define UDP_REORDER_SETS              128u
+#define UDP_REORDER_SETS              2048u
 #define UDP_REORDER_WAYS              4u
 #define UDP_REORDER_FLOW_CAP          (UDP_REORDER_SETS * UDP_REORDER_WAYS)
-#define UDP_REORDER_WINDOW            256u
-#define UDP_REORDER_START_BACKTRACK   32u
-#define UDP_REORDER_HELD_CAP          8192u
-#define UDP_REORDER_GC_SLICE          16u
+#define UDP_REORDER_WINDOW            16384u
+#define UDP_REORDER_START_BACKTRACK   (UDP_REORDER_WINDOW - 1u)
+#define UDP_REORDER_HELD_CAP          16384u
+#define UDP_REORDER_GC_SLICE          128u
 #define UDP_REORDER_FLOW_IDLE_NS      (60ULL * 1000000000ULL)
-// #define UDP_REORDER_DEFAULT_HOLD_NS   (1ULL * 1000000ULL)
-#define UDP_REORDER_DEFAULT_HOLD_NS   (100ULL * 1000ULL)
+#define UDP_REORDER_DEFAULT_HOLD_NS   (10ULL * 1000000ULL)
+#define UDP_REORDER_NODE_NONE         UINT32_MAX
 
-struct udp_reorder_slot {
+struct udp_reorder_node {
     struct dp_udp_reorder_item item;
     uint32_t seq;
-    uint8_t valid;
+    uint32_t next;
+    uint32_t prev;
 };
 
 struct udp_reorder_flow {
@@ -32,14 +33,20 @@ struct udp_reorder_flow {
     uint64_t gap_since_ns;
     uint64_t last_seen_ns;
     uint64_t stamp;
+    uint32_t head;
+    uint32_t tail;
     uint16_t held;
     uint8_t valid;
 };
 
 static struct udp_reorder_flow
     g_flows[NE_CRYPTO_WORKERS][UDP_REORDER_FLOW_CAP];
-static struct udp_reorder_slot
-    g_slots[NE_CRYPTO_WORKERS][UDP_REORDER_FLOW_CAP][UDP_REORDER_WINDOW];
+/* Sparse shared pool: RAM follows the number of packets actually waiting for
+ * a gap, instead of multiplying a 16K array by every disordered UDP flow. */
+static struct udp_reorder_node
+    g_nodes[NE_CRYPTO_WORKERS][UDP_REORDER_HELD_CAP];
+static uint32_t g_free_head[NE_CRYPTO_WORKERS];
+static uint8_t g_pool_initialized[NE_CRYPTO_WORKERS];
 static uint32_t g_held_by_worker[NE_CRYPTO_WORKERS];
 static uint32_t g_gc_cursor[NE_CRYPTO_WORKERS];
 static uint64_t g_stamp_by_worker[NE_CRYPTO_WORKERS];
@@ -106,23 +113,114 @@ static void update_high_water(uint32_t held)
     }
 }
 
-static void flow_drop_slots(int worker_idx, uint32_t flow_idx,
+static void worker_pool_init(int worker_idx)
+{
+    if (g_pool_initialized[worker_idx])
+        return;
+    for (uint32_t i = 0; i < UDP_REORDER_HELD_CAP; i++) {
+        g_nodes[worker_idx][i].next = i + 1u < UDP_REORDER_HELD_CAP
+            ? i + 1u : UDP_REORDER_NODE_NONE;
+        g_nodes[worker_idx][i].prev = UDP_REORDER_NODE_NONE;
+    }
+    g_free_head[worker_idx] = 0;
+    g_pool_initialized[worker_idx] = 1u;
+}
+
+static uint32_t worker_node_alloc(int worker_idx)
+{
+    uint32_t idx;
+    struct udp_reorder_node *node;
+
+    worker_pool_init(worker_idx);
+    idx = g_free_head[worker_idx];
+    if (idx == UDP_REORDER_NODE_NONE)
+        return idx;
+    node = &g_nodes[worker_idx][idx];
+    g_free_head[worker_idx] = node->next;
+    memset(node, 0, sizeof(*node));
+    node->next = UDP_REORDER_NODE_NONE;
+    node->prev = UDP_REORDER_NODE_NONE;
+    return idx;
+}
+
+static void worker_node_free(int worker_idx, uint32_t idx)
+{
+    struct udp_reorder_node *node;
+
+    if (idx == UDP_REORDER_NODE_NONE || idx >= UDP_REORDER_HELD_CAP)
+        return;
+    node = &g_nodes[worker_idx][idx];
+    memset(&node->item, 0, sizeof(node->item));
+    node->seq = 0;
+    node->prev = UDP_REORDER_NODE_NONE;
+    node->next = g_free_head[worker_idx];
+    g_free_head[worker_idx] = idx;
+}
+
+static void flow_drop_nodes(int worker_idx, uint32_t flow_idx,
                             const struct dp_udp_reorder_ops *ops)
 {
     struct udp_reorder_flow *flow = &g_flows[worker_idx][flow_idx];
+    uint32_t idx = flow->head;
 
-    for (uint32_t i = 0; i < UDP_REORDER_WINDOW; i++) {
-        struct udp_reorder_slot *slot = &g_slots[worker_idx][flow_idx][i];
+    while (idx != UDP_REORDER_NODE_NONE) {
+        struct udp_reorder_node *node = &g_nodes[worker_idx][idx];
+        uint32_t next = node->next;
 
-        if (!slot->valid)
-            continue;
-        item_drop(ops, &slot->item);
-        memset(slot, 0, sizeof(*slot));
+        item_drop(ops, &node->item);
+        worker_node_free(worker_idx, idx);
         if (g_held_by_worker[worker_idx] > 0)
             g_held_by_worker[worker_idx]--;
+        idx = next;
     }
+    flow->head = UDP_REORDER_NODE_NONE;
+    flow->tail = UDP_REORDER_NODE_NONE;
     flow->held = 0;
     flow->gap_since_ns = 0;
+}
+
+/* Insert by sequence into the sparse per-flow list. Starting from the tail
+ * keeps the normal increasing-sequence path O(1), while still accepting
+ * bounded displacement caused by WAN jitter.
+ * Return 0=inserted, 1=duplicate, -1=shared pool full. */
+static int flow_insert_node(int worker_idx, uint32_t flow_idx, uint32_t seq,
+                            const struct dp_udp_reorder_item *item)
+{
+    struct udp_reorder_flow *flow = &g_flows[worker_idx][flow_idx];
+    uint32_t before = UDP_REORDER_NODE_NONE;
+    uint32_t after = flow->tail;
+    uint32_t idx;
+    struct udp_reorder_node *node;
+
+    while (after != UDP_REORDER_NODE_NONE) {
+        int delta = seq_delta(seq, g_nodes[worker_idx][after].seq);
+
+        if (delta == 0)
+            return 1;
+        if (delta > 0) {
+            before = g_nodes[worker_idx][after].next;
+            break;
+        }
+        before = after;
+        after = g_nodes[worker_idx][after].prev;
+    }
+    idx = worker_node_alloc(worker_idx);
+    if (idx == UDP_REORDER_NODE_NONE)
+        return -1;
+    node = &g_nodes[worker_idx][idx];
+    node->item = *item;
+    node->seq = seq;
+    node->prev = after;
+    node->next = before;
+    if (after != UDP_REORDER_NODE_NONE)
+        g_nodes[worker_idx][after].next = idx;
+    else
+        flow->head = idx;
+    if (before != UDP_REORDER_NODE_NONE)
+        g_nodes[worker_idx][before].prev = idx;
+    else
+        flow->tail = idx;
+    return 0;
 }
 
 static void flow_reset(int worker_idx, uint32_t flow_idx,
@@ -134,8 +232,9 @@ static void flow_reset(int worker_idx, uint32_t flow_idx,
     uint32_t backtrack = first_seq < UDP_REORDER_START_BACKTRACK
         ? first_seq : UDP_REORDER_START_BACKTRACK;
 
-    if (flow->valid)
-        flow_drop_slots(worker_idx, flow_idx, ops);
+    if (flow->valid) {
+        flow_drop_nodes(worker_idx, flow_idx, ops);
+    }
     memset(flow, 0, sizeof(*flow));
     flow->key = *key;
     flow->epoch = epoch;
@@ -143,6 +242,8 @@ static void flow_reset(int worker_idx, uint32_t flow_idx,
     flow->gap_since_ns = backtrack ? now_ns : 0;
     flow->last_seen_ns = now_ns;
     flow->stamp = ++g_stamp_by_worker[worker_idx];
+    flow->head = UDP_REORDER_NODE_NONE;
+    flow->tail = UDP_REORDER_NODE_NONE;
     flow->valid = 1;
 }
 
@@ -180,54 +281,59 @@ static uint32_t flow_lookup(int worker_idx,
 }
 
 static void flow_flush_contiguous(int worker_idx, uint32_t flow_idx,
+                                  uint64_t now_ns,
                                   const struct dp_udp_reorder_ops *ops)
 {
     struct udp_reorder_flow *flow = &g_flows[worker_idx][flow_idx];
+    int advanced = 0;
 
-    for (;;) {
-        struct udp_reorder_slot *slot =
-            &g_slots[worker_idx][flow_idx][flow->next_seq % UDP_REORDER_WINDOW];
+    while (flow->head != UDP_REORDER_NODE_NONE) {
+        uint32_t idx = flow->head;
+        struct udp_reorder_node *node = &g_nodes[worker_idx][idx];
+        struct dp_udp_reorder_item item;
 
-        if (!slot->valid || slot->seq != flow->next_seq)
+        if (node->seq != flow->next_seq)
             break;
-        slot->valid = 0;
+        item = node->item;
+        flow->head = node->next;
+        if (flow->head != UDP_REORDER_NODE_NONE)
+            g_nodes[worker_idx][flow->head].prev = UDP_REORDER_NODE_NONE;
+        else
+            flow->tail = UDP_REORDER_NODE_NONE;
+        worker_node_free(worker_idx, idx);
         if (flow->held > 0)
             flow->held--;
         if (g_held_by_worker[worker_idx] > 0)
             g_held_by_worker[worker_idx]--;
         flow->next_seq++;
-        item_emit(ops, &slot->item, 1);
-        memset(&slot->item, 0, sizeof(slot->item));
+        advanced = 1;
+        item_emit(ops, &item, 1);
     }
-    flow->gap_since_ns = flow->held ? flow->gap_since_ns : 0;
+    if (!flow->held)
+        flow->gap_since_ns = 0;
+    else if (advanced || !flow->gap_since_ns)
+        flow->gap_since_ns = now_ns;
 }
 
 static int flow_smallest_ahead(int worker_idx, uint32_t flow_idx,
                                uint32_t *seq_out)
 {
     struct udp_reorder_flow *flow = &g_flows[worker_idx][flow_idx];
-    int best_delta = INT32_MAX;
-    uint32_t best_seq = 0;
+    struct udp_reorder_node *node;
+    int delta;
 
-    for (uint32_t i = 0; i < UDP_REORDER_WINDOW; i++) {
-        struct udp_reorder_slot *slot = &g_slots[worker_idx][flow_idx][i];
-        int delta;
-
-        if (!slot->valid)
-            continue;
-        delta = seq_delta(slot->seq, flow->next_seq);
-        if (delta >= 0 && delta < best_delta) {
-            best_delta = delta;
-            best_seq = slot->seq;
-        }
-    }
-    if (best_delta == INT32_MAX)
+    if (flow->head == UDP_REORDER_NODE_NONE)
         return -1;
-    *seq_out = best_seq;
-    return best_delta;
+    node = &g_nodes[worker_idx][flow->head];
+    delta = seq_delta(node->seq, flow->next_seq);
+    if (delta < 0)
+        return -1;
+    *seq_out = node->seq;
+    return delta;
 }
 
 static void flow_skip_gap(int worker_idx, uint32_t flow_idx,
+                          uint64_t now_ns,
                           const struct dp_udp_reorder_ops *ops)
 {
     struct udp_reorder_flow *flow = &g_flows[worker_idx][flow_idx];
@@ -243,20 +349,47 @@ static void flow_skip_gap(int worker_idx, uint32_t flow_idx,
         atomic_fetch_add_explicit(&g_stat_gap, (uint32_t)delta,
                                   memory_order_relaxed);
     }
-    flow_flush_contiguous(worker_idx, flow_idx, ops);
+    flow_flush_contiguous(worker_idx, flow_idx, now_ns, ops);
     if (flow->held)
-        flow->gap_since_ns = flow->last_seen_ns;
+        flow->gap_since_ns = now_ns;
+}
+
+/* Under shared-pool pressure, advance the oldest outstanding gap instead of
+ * dropping the newly arrived datagram. This preserves ordered delivery for
+ * every flow while bounding memory; a genuinely missing packet is treated as
+ * lost slightly earlier only when the entire worker pool is occupied. */
+static int worker_release_oldest_gap(int worker_idx, uint64_t now_ns,
+                                     const struct dp_udp_reorder_ops *ops)
+{
+    uint32_t victim = UDP_REORDER_NODE_NONE;
+    uint64_t oldest = UINT64_MAX;
+    uint32_t before = g_held_by_worker[worker_idx];
+
+    for (uint32_t i = 0; i < UDP_REORDER_FLOW_CAP; i++) {
+        struct udp_reorder_flow *flow = &g_flows[worker_idx][i];
+
+        if (!flow->valid || !flow->held || !flow->gap_since_ns)
+            continue;
+        if (flow->gap_since_ns < oldest) {
+            oldest = flow->gap_since_ns;
+            victim = i;
+        }
+    }
+    if (victim == UDP_REORDER_NODE_NONE)
+        return -1;
+    flow_skip_gap(worker_idx, victim, now_ns, ops);
+    return g_held_by_worker[worker_idx] < before ? 0 : -1;
 }
 
 static void flow_make_window_room(int worker_idx, uint32_t flow_idx,
-                                  uint32_t seq,
+                                  uint32_t seq, uint64_t now_ns,
                                   const struct dp_udp_reorder_ops *ops)
 {
     struct udp_reorder_flow *flow = &g_flows[worker_idx][flow_idx];
 
     while (flow->held && seq_delta(seq, flow->next_seq) >=
            (int)UDP_REORDER_WINDOW)
-        flow_skip_gap(worker_idx, flow_idx, ops);
+        flow_skip_gap(worker_idx, flow_idx, now_ns, ops);
     if (seq_delta(seq, flow->next_seq) >= (int)UDP_REORDER_WINDOW) {
         uint32_t target = seq - (UDP_REORDER_WINDOW - 1u);
         uint32_t skipped = (uint32_t)seq_delta(target, flow->next_seq);
@@ -280,8 +413,8 @@ void dp_udp_reorder_configure_from_env(void)
         if (end != hold_us && *end == '\0') {
             if (value < 100)
                 value = 100;
-            if (value > 20000)
-                value = 20000;
+            if (value > 200000)
+                value = 200000;
             g_hold_ns = (uint64_t)value * 1000ULL;
         }
     }
@@ -304,7 +437,7 @@ void dp_udp_reorder_submit(int worker_idx,
 {
     uint32_t flow_idx;
     struct udp_reorder_flow *flow;
-    struct udp_reorder_slot *slot;
+    int insert_rc;
     int delta;
 
     if (!item || !key || worker_idx < 0 ||
@@ -317,7 +450,7 @@ void dp_udp_reorder_submit(int worker_idx,
 
     if (flow->held && flow->gap_since_ns &&
         now_ns - flow->gap_since_ns >= g_hold_ns)
-        flow_skip_gap(worker_idx, flow_idx, ops);
+        flow_skip_gap(worker_idx, flow_idx, now_ns, ops);
 
     delta = seq_delta(seq, flow->next_seq);
     if (delta < 0) {
@@ -328,11 +461,11 @@ void dp_udp_reorder_submit(int worker_idx,
     if (delta == 0) {
         flow->next_seq++;
         item_emit(ops, item, 0);
-        flow_flush_contiguous(worker_idx, flow_idx, ops);
+        flow_flush_contiguous(worker_idx, flow_idx, now_ns, ops);
         return;
     }
 
-    flow_make_window_room(worker_idx, flow_idx, seq, ops);
+    flow_make_window_room(worker_idx, flow_idx, seq, now_ns, ops);
     delta = seq_delta(seq, flow->next_seq);
     if (delta < 0) {
         atomic_fetch_add_explicit(&g_stat_late, 1u, memory_order_relaxed);
@@ -342,34 +475,27 @@ void dp_udp_reorder_submit(int worker_idx,
     if (delta == 0) {
         flow->next_seq++;
         item_emit(ops, item, 0);
-        flow_flush_contiguous(worker_idx, flow_idx, ops);
+        flow_flush_contiguous(worker_idx, flow_idx, now_ns, ops);
         return;
     }
-    if (g_held_by_worker[worker_idx] >= UDP_REORDER_HELD_CAP) {
-        flow_skip_gap(worker_idx, flow_idx, ops);
-        if (g_held_by_worker[worker_idx] >= UDP_REORDER_HELD_CAP) {
-            atomic_fetch_add_explicit(&g_stat_overflow, 1u, memory_order_relaxed);
+    insert_rc = flow_insert_node(worker_idx, flow_idx, seq, item);
+    if (insert_rc > 0) {
+        atomic_fetch_add_explicit(&g_stat_late, 1u, memory_order_relaxed);
+        item_drop(ops, item);
+        return;
+    }
+    if (insert_rc < 0) {
+        if (worker_release_oldest_gap(worker_idx, now_ns, ops) == 0)
+            insert_rc = flow_insert_node(worker_idx, flow_idx, seq, item);
+        if (insert_rc != 0) {
+            atomic_fetch_add_explicit(&g_stat_overflow, 1u,
+                                      memory_order_relaxed);
             item_drop(ops, item);
             return;
         }
     }
-
-    slot = &g_slots[worker_idx][flow_idx][seq % UDP_REORDER_WINDOW];
-    if (slot->valid) {
-        if (slot->seq == seq) {
-            atomic_fetch_add_explicit(&g_stat_late, 1u, memory_order_relaxed);
-            item_drop(ops, item);
-            return;
-        }
-        item_drop(ops, &slot->item);
-        atomic_fetch_add_explicit(&g_stat_overflow, 1u, memory_order_relaxed);
-    } else {
-        flow->held++;
-        g_held_by_worker[worker_idx]++;
-    }
-    slot->item = *item;
-    slot->seq = seq;
-    slot->valid = 1;
+    flow->held++;
+    g_held_by_worker[worker_idx]++;
     if (!flow->gap_since_ns)
         flow->gap_since_ns = now_ns;
     atomic_fetch_add_explicit(&g_stat_held, 1u, memory_order_relaxed);
@@ -392,9 +518,11 @@ void dp_udp_reorder_gc(int worker_idx, uint64_t now_ns,
             continue;
         if (flow->held && flow->gap_since_ns &&
             now_ns - flow->gap_since_ns >= g_hold_ns)
-            flow_skip_gap(worker_idx, idx, ops);
-        if (!flow->held && now_ns - flow->last_seen_ns > UDP_REORDER_FLOW_IDLE_NS)
+            flow_skip_gap(worker_idx, idx, now_ns, ops);
+        if (!flow->held &&
+            now_ns - flow->last_seen_ns > UDP_REORDER_FLOW_IDLE_NS) {
             memset(flow, 0, sizeof(*flow));
+        }
     }
     g_gc_cursor[worker_idx] = (cursor + UDP_REORDER_GC_SLICE) %
         UDP_REORDER_FLOW_CAP;
@@ -407,11 +535,13 @@ void dp_udp_reorder_reset_worker(int worker_idx,
         return;
     for (uint32_t idx = 0; idx < UDP_REORDER_FLOW_CAP; idx++) {
         if (g_flows[worker_idx][idx].valid)
-            flow_drop_slots(worker_idx, idx, ops);
+            flow_drop_nodes(worker_idx, idx, ops);
         memset(&g_flows[worker_idx][idx], 0,
                sizeof(g_flows[worker_idx][idx]));
     }
     g_held_by_worker[worker_idx] = 0;
+    g_pool_initialized[worker_idx] = 0;
+    worker_pool_init(worker_idx);
     g_gc_cursor[worker_idx] = 0;
 }
 

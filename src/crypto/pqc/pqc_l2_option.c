@@ -4,6 +4,7 @@
 #include "../../../inc/crypto/eth_parse.h"
 #include "../../../inc/core/iface/interface.h"
 #include "../../../inc/core/util/cpu_map.h"
+#include "../../../inc/core/dataplane/tcp_bond_reorder.h"
 #include "../../options/common/opt_no_frag_ops.h"
 
 #include <string.h>
@@ -320,8 +321,12 @@ static int opt_policy_match(const struct app_config *cfg, int action, uint8_t wi
 #define L2_POLICY_LEN           1
 #define L2_CORE_ID_LEN          1
 #define L2_UDP_MARKER_SIZE      4u
+#define L2_TCP_MARKER_SIZE      4u
 static const uint8_t l2_udp_marker[L2_UDP_MARKER_SIZE] = {
     0x5Bu, 0x55u, 0x44u, 0x01u /* magic, 'U', 'D', wire version */
+};
+static const uint8_t l2_tcp_marker[L2_TCP_MARKER_SIZE] = {
+    0x5Bu, 0x54u, 0x43u, 0x01u /* magic, 'T', 'C', wire version */
 };
 
 static int l2_udp_marker_match(const uint8_t *packet, size_t pkt_len, int off)
@@ -334,6 +339,18 @@ static int l2_udp_marker_match(const uint8_t *packet, size_t pkt_len, int off)
 static void l2_udp_marker_write(uint8_t *packet, int off)
 {
     memcpy(packet + off, l2_udp_marker, L2_UDP_MARKER_SIZE);
+}
+
+static int l2_tcp_marker_match(const uint8_t *packet, size_t pkt_len, int off)
+{
+    return packet && off >= 0 &&
+        pkt_len >= (size_t)off + L2_TCP_MARKER_SIZE &&
+        memcmp(packet + off, l2_tcp_marker, L2_TCP_MARKER_SIZE) == 0;
+}
+
+static void l2_tcp_marker_write(uint8_t *packet, int off)
+{
+    memcpy(packet + off, l2_tcp_marker, L2_TCP_MARKER_SIZE);
 }
 
 #define L2_NONCE_SIZE           CRYPTO_PQC_NONCE_BYTES
@@ -414,6 +431,33 @@ static int l2_wire_prefix_len(const uint8_t *packet, size_t pkt_len)
 }
 
 #define OPT_FRAG_META_LEN       47
+#define L2_TCP_SHIM_VERSION     1u
+#define L2_TCP_SHIM_SIZE        9u
+
+static void l2_tcp_write_shim(uint8_t *buf, uint32_t epoch, uint32_t seq)
+{
+    buf[0] = L2_TCP_SHIM_VERSION;
+    buf[1] = (uint8_t)(epoch >> 24);
+    buf[2] = (uint8_t)(epoch >> 16);
+    buf[3] = (uint8_t)(epoch >> 8);
+    buf[4] = (uint8_t)epoch;
+    buf[5] = (uint8_t)(seq >> 24);
+    buf[6] = (uint8_t)(seq >> 16);
+    buf[7] = (uint8_t)(seq >> 8);
+    buf[8] = (uint8_t)seq;
+}
+
+static int l2_tcp_read_shim(const uint8_t *buf, uint32_t *epoch,
+                            uint32_t *seq)
+{
+    if (!buf || !epoch || !seq || buf[0] != L2_TCP_SHIM_VERSION)
+        return -1;
+    *epoch = ((uint32_t)buf[1] << 24) | ((uint32_t)buf[2] << 16) |
+        ((uint32_t)buf[3] << 8) | (uint32_t)buf[4];
+    *seq = ((uint32_t)buf[5] << 24) | ((uint32_t)buf[6] << 16) |
+        ((uint32_t)buf[7] << 8) | (uint32_t)buf[8];
+    return (*epoch != 0 && *seq != 0) ? 0 : -1;
+}
 
 static int l2_do_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet,
                          size_t pkt_len, int l3_off)
@@ -441,6 +485,43 @@ static int l2_do_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet,
         return -1;
     return enc_start + new_len;
 
+}
+
+static int l2_do_encrypt_tcp(struct packet_crypto_ctx *ctx, uint8_t *packet,
+                             size_t pkt_len, int l3_off)
+{
+    uint8_t nonce[CRYPTO_PQC_NONCE_BYTES];
+    uint32_t epoch;
+    uint32_t seq;
+    int et_off;
+    int marker_off;
+    int enc_start;
+    int new_len = 0;
+    size_t payload_len;
+    size_t plain_len;
+
+    if (!ctx || l3_off < 2 || (size_t)l3_off > pkt_len ||
+        dp_tcp_bond_next_tx_meta(ctx->wire_id, &epoch, &seq) != 0)
+        return -1;
+    et_off = l3_off - 2;
+    payload_len = pkt_len - (size_t)l3_off;
+    marker_off = et_off + 2 + L2_POLICY_LEN + L2_CORE_ID_LEN + L2_NONCE_SIZE;
+    enc_start = marker_off + (int)L2_TCP_MARKER_SIZE;
+    plain_len = L2_TCP_SHIM_SIZE + payload_len;
+    if ((size_t)enc_start + plain_len + AES_GCM_TAG_SIZE > NE_FRAME)
+        return -1;
+
+    memmove(packet + enc_start + L2_TCP_SHIM_SIZE,
+            packet + l3_off, payload_len);
+    l2_tcp_write_shim(packet + enc_start, epoch, seq);
+    if (packet_crypto_generate_nonce(nonce) != 0)
+        return -1;
+    l2_write_wire_header(packet, et_off, ctx->wire_id, nonce, L2_NONCE_SIZE);
+    l2_tcp_marker_write(packet, marker_off);
+    if (packet_crypto_encrypt(ctx, nonce, packet + enc_start,
+                              (int)plain_len, &new_len) != 0)
+        return -1;
+    return enc_start + new_len;
 }
 
 static int l2_do_encrypt_udp(struct packet_crypto_ctx *ctx, uint8_t *packet,
@@ -498,6 +579,40 @@ static int l2_do_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t 
         return -1;
     return l2_restore_plain_packet(packet, pkt_len, packet + enc_start, (size_t)dec_len);
 
+}
+
+static int l2_do_decrypt_tcp(struct packet_crypto_ctx *ctx, uint8_t *packet,
+                             size_t pkt_len, uint32_t *epoch, uint32_t *seq)
+{
+    uint8_t nonce[CRYPTO_PQC_NONCE_BYTES];
+    int marker_off = l2_enc_start_off(packet, pkt_len);
+    int enc_start;
+    int l3_off;
+    int dec_len = 0;
+    size_t payload_len;
+
+    if (!ctx || !epoch || !seq ||
+        !l2_tcp_marker_match(packet, pkt_len, marker_off))
+        return -1;
+    enc_start = marker_off + (int)L2_TCP_MARKER_SIZE;
+    if (pkt_len < (size_t)enc_start + L2_TCP_SHIM_SIZE + AES_GCM_TAG_SIZE)
+        return -1;
+    memcpy(nonce, packet + l2_nonce_off(packet, pkt_len), (size_t)L2_NONCE_SIZE);
+    if (packet_crypto_decrypt(ctx, nonce, packet + enc_start,
+                              (int)(pkt_len - (size_t)enc_start), &dec_len) != 0)
+        return -1;
+    if (dec_len < (int)L2_TCP_SHIM_SIZE ||
+        l2_tcp_read_shim(packet + enc_start, epoch, seq) != 0)
+        return -1;
+    payload_len = (size_t)dec_len - L2_TCP_SHIM_SIZE;
+    l3_off = crypto_eth_l2_prefix_len(packet, pkt_len);
+    if (l3_off < 0)
+        return -1;
+    l3_off += 2;
+    memmove(packet + l3_off, packet + enc_start + L2_TCP_SHIM_SIZE,
+            payload_len);
+    crypto_eth_set_ipv4_et(packet, l3_off - 2);
+    return l3_off + (int)payload_len;
 }
 
 static int l2_do_decrypt_udp(struct packet_crypto_ctx *ctx, uint8_t *packet,
@@ -948,6 +1063,25 @@ static int l2_ip_encrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt,
     return 0;
 }
 
+static int l2_tcp_encrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt,
+                          uint32_t *pkt_len)
+{
+    int l3_off;
+    int n;
+
+    if (unlikely(!ctx || !ctx->initialized || !pkt || !pkt_len ||
+                 *pkt_len < MIN_ETH_PKT))
+        return -1;
+    l3_off = crypto_eth_ipv4_offset(pkt, *pkt_len);
+    if (l3_off < 0)
+        return 0;
+    n = l2_do_encrypt_tcp(ctx, pkt, *pkt_len, l3_off);
+    if (n < 0)
+        return -1;
+    *pkt_len = (uint32_t)n;
+    return 0;
+}
+
 int crypto_l2_pqc_encrypt_tcp_l3(struct packet_crypto_ctx *ctx,
                                  uint8_t *pkt, uint32_t *pkt_len,
                                  int l3_off)
@@ -958,7 +1092,7 @@ int crypto_l2_pqc_encrypt_tcp_l3(struct packet_crypto_ctx *ctx,
                  *pkt_len < MIN_ETH_PKT || l3_off < 0 ||
                  (uint32_t)l3_off > *pkt_len))
         return -1;
-    n = l2_do_encrypt(ctx, pkt, *pkt_len, l3_off);
+    n = l2_do_encrypt_tcp(ctx, pkt, *pkt_len, l3_off);
     if (n < 0)
         return -1;
     *pkt_len = (uint32_t)n;
@@ -978,6 +1112,29 @@ static int l2_ip_decrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt,
     if (n < 0)
         return -1;
     *pkt_len = (uint32_t)n;
+    return 0;
+}
+
+static int l2_tcp_decrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt,
+                          uint32_t *pkt_len)
+{
+    uint32_t epoch;
+    uint32_t seq;
+    int marker_off;
+    int n;
+
+    if (unlikely(!ctx || !ctx->initialized || !pkt || !pkt_len))
+        return -1;
+    if (!crypto_eth_l2_has_marker(pkt, *pkt_len))
+        return 0;
+    marker_off = l2_enc_start_off(pkt, *pkt_len);
+    if (!l2_tcp_marker_match(pkt, *pkt_len, marker_off))
+        return l2_ip_decrypt(ctx, pkt, pkt_len);
+    n = l2_do_decrypt_tcp(ctx, pkt, *pkt_len, &epoch, &seq);
+    if (n < 0 || !crypto_pkt_is_ipv4(pkt, (size_t)n))
+        return -1;
+    *pkt_len = (uint32_t)n;
+    crypto_option_tcp_set_rx_meta(epoch, seq);
     return 0;
 }
 
@@ -1014,7 +1171,7 @@ static int l2_arp_decrypt(struct packet_crypto_ctx *ctx, uint8_t *pkt,
     return 0;
 }
 
-CRYPTO_OPS_PLAIN(crypto_opt_l2_pqc_tcp_ops, l2_ip_encrypt, l2_ip_decrypt)
+CRYPTO_OPS_PLAIN(crypto_opt_l2_pqc_tcp_ops, l2_tcp_encrypt, l2_tcp_decrypt)
 CRYPTO_OPS_PLAIN(crypto_opt_l2_pqc_ospf_ops, l2_ip_encrypt, l2_ip_decrypt)
 CRYPTO_OPS_PLAIN(crypto_opt_l2_pqc_arp_ops, l2_arp_encrypt, l2_arp_decrypt)
 

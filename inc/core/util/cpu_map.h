@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+struct app_config;
+
 
 static const uint8_t NE_CPU_RX_LAN[]  = { 0u };
 static const uint8_t NE_CPU_TX[]      = { 1u, 2u, 9u, 10u };
@@ -36,5 +38,6 @@ static inline uint8_t ne_cpu_crypto(uint32_t worker)
 }
 
 int ne_cpu_map_validate(void);
+int ne_cpu_map_configure_irq_affinity(const struct app_config *cfg);
 
 #endif

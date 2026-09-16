@@ -477,6 +477,7 @@ static void *crypto_worker_thread(void *arg)
         if (crypto_on && ++gc_tick >= 2048) {
             fwd_crypto_frag_gc_worker_tick(ctx->worker_idx);
             dataplane_udp_reorder_gc(fwd, ctx->worker_idx);
+            dataplane_tcp_bond_reorder_gc(fwd);
             gc_tick = 0;
         }
 
@@ -503,6 +504,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg)
 
     memset(fwd, 0, sizeof(*fwd));
     dataplane_udp_reorder_configure();
+    dataplane_tcp_bond_reorder_configure();
     fwd->cfg = cfg;
     fwd->local_count = cfg->local_count;
     fwd->wan_count = config_count_dataplane_wans(cfg);
@@ -624,6 +626,7 @@ static void forwarder_join_started(struct forwarder *fwd, int local_rx_started, 
         pthread_join(fwd->crypto_threads[w], NULL);
     for (int w = 0; w < wan_rx_started; w++)
         pthread_join(fwd->wan_rx_threads[w], NULL);
+    dataplane_tcp_bond_reorder_reset(fwd);
 }
 
 void forwarder_run(struct forwarder *fwd)
@@ -641,6 +644,7 @@ void forwarder_run(struct forwarder *fwd)
 
     if (ne_cpu_map_validate() != 0)
         return;
+    (void)ne_cpu_map_configure_irq_affinity(fwd->cfg);
 
     active_tx_slots = forwarder_active_tx_slots(fwd);
     dp_route_set_active_tx_slots((uint32_t)active_tx_slots);
@@ -711,6 +715,7 @@ void forwarder_run(struct forwarder *fwd)
         pthread_join(fwd->crypto_threads[w], NULL);
     for (int w = 0; w < wan_rx_started; w++)
         pthread_join(fwd->wan_rx_threads[w], NULL);
+    dataplane_tcp_bond_reorder_reset(fwd);
     fwd->threads_started = 0;
 }
 
